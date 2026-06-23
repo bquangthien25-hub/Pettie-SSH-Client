@@ -1,0 +1,7 @@
+# Python — Pettie SSH Client
+# Linux: chạy MỘT lệnh → cài thư viện + xfreerdp + đóng gói app:
+#   bash install-linux.sh
+
+PySide6>=6.5
+paramiko>=3.0
+pyinstaller>=6.0

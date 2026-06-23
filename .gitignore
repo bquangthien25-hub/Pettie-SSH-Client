@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+pettie
+vendor/freerdp/
+*.spec.bak
+.venv/
+venv/
+.env
+*.log
