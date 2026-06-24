@@ -308,9 +308,7 @@ def _register_rdp_server_registry(address, username):
         return
     try:
         import winreg
-        host = address
-        if ":" in host and not host.startswith("["):
-            host, _ = host.rsplit(":", 1)
+        host, _ = _parse_rdp_address(address)
         path = rf"Software\Microsoft\Terminal Server Client\Servers\{host}"
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, path) as key:
             winreg.SetValueEx(key, "UsernameHint", 0, winreg.REG_SZ, username)
@@ -389,19 +387,67 @@ def _mstsc_target(address):
     return f"{host}:{port}"
 
 
-def _windows_mstsc_argv(address, fullscreen=False, desk_w=None, desk_h=None):
-    """
-    mstsc /v:host — không mở file .rdp nên Windows 11 không hiện cảnh báo publisher.
-    """
+def _local_screen_size():
+    screen = QGuiApplication.primaryScreen()
+    if not screen:
+        return 1600, 900
+    rect = screen.availableGeometry()
+    return max(800, rect.width()), max(600, rect.height())
+
+
+def _write_rdp_session_file(address, fullscreen=False):
+    """File .rdp tạm — chỉ smart sizing + dynamic resolution (không khóa kích thước)."""
+    full_address = _mstsc_target(address)
+    lines = [
+        f"full address:s:{full_address}",
+        "screen mode id:i:1" if fullscreen else "screen mode id:i:2",
+        "smart sizing:i:1",
+        "dynamic resolution:i:1",
+        "prompt for credentials:i:0",
+        "authentication level:i:2",
+        "negotiate security layer:i:1",
+        "enablecredsspsupport:i:1",
+        "redirectclipboard:i:1",
+    ]
+    fd, path = tempfile.mkstemp(suffix=".rdp", prefix="pettie_")
+    os.close(fd)
+    with open(path, "w", encoding="utf-16-le") as f:
+        f.write("\ufeff" + "\r\n".join(lines) + "\r\n")
+    secure_chmod(path)
+    return path
+
+
+def _mstsc_startupinfo_maximized():
+    """Yêu cầu Windows mở cửa sổ mstsc ở trạng thái maximize."""
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 3  # SW_MAXIMIZE
+    return si
+
+
+def _windows_mstsc_argv(address, fullscreen=False):
+    """mstsc /v:host — để Windows tự quản lý kích thước / maximize như mở tay."""
     mstsc = _find_mstsc()
     if not mstsc:
         return None
     args = [mstsc, f"/v:{_mstsc_target(address)}"]
     if fullscreen:
         args.append("/f")
-    elif desk_w and desk_h:
-        args.extend([f"/w:{int(desk_w)}", f"/h:{int(desk_h)}"])
     return args
+
+
+def _run_windows_mstsc(address, fullscreen=True, cmdkey_targets=None, password=None):
+    """mstsc /v:host /f — Full screen; cmdkey giữ đến khi phiên đóng."""
+    mstsc = _find_mstsc()
+    if not mstsc:
+        return None
+    _ensure_rdp_windows_trust_registry()
+    if password:
+        _start_auto_confirm_rdp_thread(password, enabled=True)
+    target = _mstsc_target(address)
+    subprocess.Popen([mstsc, f"/v:{target}", "/f"])
+    _schedule_windows_rdp_cleanup(None, cmdkey_targets or [], mstsc_proc=None)
+    return True
 
 
 def _cmdkey_delete_targets(targets):
@@ -417,19 +463,49 @@ def _cmdkey_delete_targets(targets):
         )
 
 
+def _mstsc_session_running():
+    """Còn tiến trình mstsc.exe đang chạy không."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq mstsc.exe", "/NH"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return "mstsc.exe" in (out.stdout or "").lower()
+    except OSError:
+        return False
+
+
+def _wait_for_mstsc_session_end(poll_sec=2.0, start_timeout=45.0, max_wait=86400):
+    """Chờ mstsc khởi động rồi chờ đến khi phiên đóng (launcher PID không dùng được)."""
+    deadline = time.monotonic() + max_wait
+    started = False
+    start_deadline = time.monotonic() + start_timeout
+    while time.monotonic() < start_deadline:
+        if _mstsc_session_running():
+            started = True
+            break
+        time.sleep(0.5)
+    if not started:
+        return
+    while time.monotonic() < deadline:
+        if not _mstsc_session_running():
+            return
+        time.sleep(poll_sec)
+
+
 def _schedule_windows_rdp_cleanup(rdp_file, cmdkey_targets, mstsc_proc=None, max_wait=86400):
-    """Xóa file .rdp tạm và cmdkey sau khi mstsc đóng (hoặc sau max_wait giây)."""
+    """Xóa file .rdp tạm và cmdkey sau khi phiên mstsc đóng hẳn."""
 
     def worker():
         try:
             if mstsc_proc is not None:
                 try:
-                    mstsc_proc.wait(timeout=max_wait)
+                    mstsc_proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    try:
-                        mstsc_proc.terminate()
-                    except OSError:
-                        pass
+                    pass
+            _wait_for_mstsc_session_end(max_wait=max_wait)
         finally:
             _cmdkey_delete_targets(cmdkey_targets)
             if rdp_file and os.path.isfile(rdp_file):
@@ -808,11 +884,15 @@ class RemoteDesktopDialog(QDialog):
         layout.addWidget(self.chk_tunnel)
 
         self.chk_fullscreen = QCheckBox("Mở toàn màn hình")
-        self.chk_fullscreen.setChecked(False)
+        self.chk_fullscreen.setChecked(True)
         self.chk_fullscreen.setToolTip(
-            "Mặc định mở cửa sổ vừa màn hình (dễ nhìn hơn).\n"
-            "Linux: Ctrl+Alt+Enter bật/tắt fullscreen · thanh công cụ ở mép trên"
+            "Windows: luôn bật Full screen trong Remote Desktop Connection.\n"
+            "Thoát full screen: Ctrl+Alt+Break.\n"
+            "Linux: Ctrl+Alt+Enter."
         )
+        if is_windows():
+            self.chk_fullscreen.setEnabled(False)
+            self.chk_fullscreen.setText("Full screen (tự động trên Windows)")
         layout.addWidget(self.chk_fullscreen)
 
         fs_hint = QLabel(
@@ -1032,17 +1112,13 @@ class RemoteDesktopDialog(QDialog):
             self._rdp_password = password
             self._start_auto_confirm_thread(password)
             fullscreen = self.chk_fullscreen.isChecked()
-            win_w, win_h, _, _ = self._rdp_geometry()
-            _ensure_rdp_windows_trust_registry()
-            mstsc_args = _windows_mstsc_argv(
-                address, fullscreen=fullscreen, desk_w=win_w, desk_h=win_h,
+            proc = _run_windows_mstsc(
+                address,
+                cmdkey_targets=list(self._cmdkey_targets),
+                password=password,
             )
-            if not mstsc_args:
+            if not proc:
                 return False, None
-            proc = subprocess.Popen(mstsc_args)
-            _schedule_windows_rdp_cleanup(
-                None, list(self._cmdkey_targets), mstsc_proc=proc,
-            )
             return True, "mstsc"
 
         linux_user, linux_domain = self._linux_rdp_user_domain(domain_field)
@@ -1230,14 +1306,6 @@ def _rdp_address(host, port=None):
     if ":" in host and not host.startswith("["):
         return host
     return f"{host}:{port}"
-
-
-def _local_screen_size():
-    screen = QGuiApplication.primaryScreen()
-    if not screen:
-        return 1600, 900
-    rect = screen.availableGeometry()
-    return max(800, rect.width()), max(600, rect.height())
 
 
 def _freerdp_geometry(fullscreen=False):
@@ -1440,13 +1508,9 @@ def _launch_macos_rdp(address, user, password, domain="", fullscreen=False):
     return True, client_kind
 
 
-def _windows_launch_rdp(address, user, password, domain="", fullscreen=False):
-    """Khởi chạy mstsc /v:host (tránh cảnh báo .rdp) hoặc xfreerdp dự phòng."""
-    win_w, win_h, _, _ = _freerdp_geometry(fullscreen=fullscreen)
-    mstsc_args = _windows_mstsc_argv(
-        address, fullscreen=fullscreen, desk_w=win_w, desk_h=win_h,
-    )
-    if not mstsc_args:
+def _windows_launch_rdp(address, user, password, domain="", fullscreen=True):
+    """Khởi chạy mstsc /v:host — giống mở Remote Desktop thủ công."""
+    if not _find_mstsc():
         kind, ref = _find_windows_freerdp()
         if ref:
             host, port = _parse_rdp_address(address)
@@ -1460,23 +1524,27 @@ def _windows_launch_rdp(address, user, password, domain="", fullscreen=False):
     rdp_domain = (domain or "").strip()
     full_user = f"{rdp_domain}\\{rdp_user}" if rdp_domain else f".\\{rdp_user}"
 
-    _ensure_rdp_windows_trust_registry()
     _register_rdp_server_registry(address, full_user)
     cmdkey_targets = _store_windows_rdp_credentials(
         address, [full_user, f".\\{rdp_user}", rdp_user], password,
     )
-    _start_auto_confirm_rdp_thread(password, enabled=True)
-    proc = subprocess.Popen(mstsc_args)
-    _schedule_windows_rdp_cleanup(None, cmdkey_targets, mstsc_proc=proc)
+    ok = _run_windows_mstsc(
+        address,
+        cmdkey_targets=cmdkey_targets,
+        password=password,
+    )
+    if not ok:
+        return False, None
     return True, "mstsc"
 
 
-def _launch_rdp_client(address, user, password, domain="", fullscreen=False):
+def _launch_rdp_client(address, user, password, domain="", fullscreen=None):
     """Một điểm vào RDP — Linux, Windows và macOS."""
     if is_windows():
-        return _windows_launch_rdp(address, user, password, domain, fullscreen=fullscreen)
+        return _windows_launch_rdp(address, user, password, domain)
     if is_macos():
-        return _launch_macos_rdp(address, user, password, domain, fullscreen=fullscreen)
+        fs = True if fullscreen is None else fullscreen
+        return _launch_macos_rdp(address, user, password, domain, fullscreen=fs)
     return _launch_linux_rdp(address, user, password, domain)
 
 
@@ -1529,6 +1597,7 @@ def connect_direct_rdp(
 
     address = _rdp_address(rdp_host, port)
     try:
+        # Windows: luôn Full screen (mstsc tự tích — Maximize mới hoạt động).
         launched, detail = _launch_rdp_client(address, user, password, domain)
         if launched:
             client = detail or _rdp_client_label()
