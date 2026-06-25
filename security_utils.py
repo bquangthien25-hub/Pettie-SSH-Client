@@ -1,5 +1,6 @@
 """Kiểm tra đầu vào — giảm command injection khi gọi shell/SSH."""
 
+import os
 import re
 
 _IPV4_RE = re.compile(
@@ -81,9 +82,57 @@ def validate_remote_shell_command(cmd: str) -> str:
         raise ValueError("Lệnh trống.")
     if "\x00" in cmd:
         raise ValueError("Lệnh không hợp lệ.")
+    if _CMD_METACHAR_RE.search(cmd):
+        raise ValueError("Lệnh chứa ký tự shell không hợp lệ.")
     if len(cmd) > 8000:
         raise ValueError("Lệnh quá dài.")
     return cmd
+
+
+def validate_ssh_key_path(key_path: str) -> str:
+    """Đường dẫn file khóa SSH — phải là file thường, kích thước hợp lý."""
+    key_path = (key_path or "").strip()
+    if not key_path:
+        return ""
+    path = os.path.abspath(os.path.expanduser(key_path))
+    if not os.path.isfile(path):
+        raise ValueError("File khóa SSH không tồn tại.")
+    try:
+        if os.path.islink(path):
+            raise ValueError("Không dùng symlink làm khóa SSH.")
+    except OSError:
+        pass
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        raise ValueError("Không đọc được file khóa SSH.") from None
+    if size > 1024 * 1024:
+        raise ValueError("File khóa SSH quá lớn.")
+    return path
+
+
+def validate_remote_entry_name(name: str) -> str:
+    """Tên file/thư mục trên remote — chặn path traversal."""
+    name = (name or "").strip()
+    if not name or name in (".", ".."):
+        raise ValueError("Tên không hợp lệ.")
+    if "\x00" in name or "/" in name or "\\" in name:
+        raise ValueError("Tên không được chứa / hoặc \\.")
+    if len(name) > 255:
+        raise ValueError("Tên quá dài.")
+    return name
+
+
+def validate_search_pattern(pattern: str) -> str:
+    """Chuỗi tìm kiếm file — giới hạn độ dài, chặn null byte."""
+    pattern = (pattern or "").strip()
+    if not pattern:
+        raise ValueError("Chuỗi tìm kiếm trống.")
+    if "\x00" in pattern:
+        raise ValueError("Chuỗi tìm kiếm không hợp lệ.")
+    if len(pattern) > 200:
+        raise ValueError("Chuỗi tìm kiếm quá dài.")
+    return pattern
 
 
 def ssh_argv(user: str, host: str, port) -> list:

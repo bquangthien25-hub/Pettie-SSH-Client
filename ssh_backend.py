@@ -126,6 +126,12 @@ class SSHManager:
         "timeout": max(3, int(timeout)),
       }
       pwd_bytes = self._password_to_bytes(password)
+      if key_path:
+        from security_utils import validate_ssh_key_path
+        try:
+          key_path = validate_ssh_key_path(key_path)
+        except ValueError as e:
+          return False, str(e)
       if key_path and os.path.isfile(key_path):
         kwargs["key_filename"] = key_path
         if pwd_bytes:

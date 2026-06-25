@@ -21,6 +21,7 @@ from sftp_paths import (
     parent_windows_sftp,
 )
 from platform_utils import detect_local_os, format_os_display
+from security_utils import validate_remote_entry_name, validate_search_pattern
 from progress_bars import TransferProgressPanel, _normalize_bytes, _fmt_bytes, ByteProgressTracker
 
 
@@ -782,10 +783,15 @@ class SftpFileManagerWindow(QMainWindow):
         )
         if not ok or not pattern.strip():
             return
+        try:
+            pattern = validate_search_pattern(pattern)
+        except ValueError as e:
+            QMessageBox.warning(self, "Tìm file", str(e))
+            return
         self.status.showMessage(f"Đang tìm '{pattern}'...")
         QApplication.processEvents()
         results = self.ssh.search_remote_files(
-            self.remote_pane.current_path, pattern.strip(), max_results=100
+            self.remote_pane.current_path, pattern, max_results=100
         )
         if not results:
             QMessageBox.information(self, "Tìm kiếm", "Không thấy kết quả.")
@@ -808,8 +814,13 @@ class SftpFileManagerWindow(QMainWindow):
         )
         if not ok or not new_name.strip() or new_name == entry["name"]:
             return
+        try:
+            new_name = validate_remote_entry_name(new_name)
+        except ValueError as e:
+            QMessageBox.warning(self, "Đổi tên", str(e))
+            return
         old = self.remote_pane._join(self.remote_pane.current_path, entry["name"])
-        new = self.remote_pane._join(self.remote_pane.current_path, new_name.strip())
+        new = self.remote_pane._join(self.remote_pane.current_path, new_name)
         if self.ssh.rename_remote(old, new):
             self.remote_pane.refresh()
             self.status.showMessage(f"Đã đổi tên → {new_name}")

@@ -43,6 +43,7 @@ from security_utils import (
     validate_ssh_host,
     validate_ssh_user,
     validate_ssh_port,
+    validate_ssh_key_path,
     validate_windows_logon,
 )
 from host_key_store import (
@@ -2181,6 +2182,12 @@ class PettieSSHClient(QWidget):
                 return
 
             key_path = self.txt_key.text().strip() or None
+            if key_path:
+                try:
+                    key_path = validate_ssh_key_path(key_path)
+                except ValueError as e:
+                    QMessageBox.warning(self, tr("warn_title"), str(e))
+                    return
             self._start_ssh_connect(host, port, user, password, key_path)
         else:
             self._disconnect_session()

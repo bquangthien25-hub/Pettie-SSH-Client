@@ -25,6 +25,7 @@ from security_utils import (
     validate_windows_logon,
 )
 from platform_utils import is_windows, is_macos, is_linux
+from windows_cred import cred_write_generic, cred_delete_generic
 from freerdp_bootstrap import (
     find_bundled_freerdp,
     bundled_env,
@@ -362,7 +363,7 @@ def _termsrv_targets(address):
 
 
 def _store_windows_rdp_credentials(address, usernames, password):
-    """Lưu credential RDP qua cmdkey — mstsc /v: dùng TERMSRV/*."""
+    """Lưu credential RDP qua WinAPI — mật khẩu không xuất hiện trên command line."""
     if not is_windows():
         return []
     flags = subprocess.CREATE_NO_WINDOW
@@ -371,11 +372,16 @@ def _store_windows_rdp_credentials(address, usernames, password):
         for username in usernames:
             if not username:
                 continue
-            subprocess.run(
-                ["cmdkey", "/generic:" + termsrv, "/user:" + username, "/pass:" + password],
-                capture_output=True,
-                creationflags=flags,
-            )
+            try:
+                username = validate_windows_logon(username)
+            except ValueError:
+                continue
+            if not cred_write_generic(termsrv, username, password):
+                subprocess.run(
+                    ["cmdkey", "/generic:" + termsrv, "/user:" + username],
+                    capture_output=True,
+                    creationflags=flags,
+                )
         cmdkey_targets.append(termsrv)
     return cmdkey_targets
 
@@ -451,16 +457,11 @@ def _run_windows_mstsc(address, fullscreen=True, cmdkey_targets=None, password=N
 
 
 def _cmdkey_delete_targets(targets):
-    """Xóa credential TERMSRV đã lưu qua cmdkey."""
+    """Xóa credential TERMSRV đã lưu."""
     if not is_windows() or not targets:
         return
-    flags = subprocess.CREATE_NO_WINDOW
     for target in targets:
-        subprocess.run(
-            ["cmdkey", "/delete:" + target],
-            capture_output=True,
-            creationflags=flags,
-        )
+        cred_delete_generic(target)
 
 
 def _mstsc_session_running():
@@ -541,23 +542,55 @@ def _find_windows_freerdp():
     return None, None
 
 
+def _sanitize_remmina_field(value, max_len=256):
+    """Chặn newline injection trong file cấu hình Remmina."""
+    return (value or "").replace("\n", "").replace("\r", "")[:max_len]
+
+
+def _secure_remove_file(path):
+    """Ghi đè rồi xóa file tạm chứa dữ liệu nhạy cảm."""
+    try:
+        if os.path.isfile(path):
+            size = os.path.getsize(path)
+            with open(path, "r+b") as f:
+                f.write(b"\x00" * min(size, 8192))
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _schedule_remmina_profile_cleanup(path, proc=None, max_wait=3600):
+    def worker():
+        if proc is not None:
+            try:
+                proc.wait(timeout=max_wait)
+            except subprocess.TimeoutExpired:
+                time.sleep(5)
+        else:
+            time.sleep(15)
+        _secure_remove_file(path)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def _launch_remmina(host, port, user, password, domain="", client_ref="remmina", flatpak_id=None):
     """
     Mở Remmina với profile tạm (IP + user + pass) — giống bấm Connect trong Remmina.
     """
-    domain = (domain or "").strip()
-    rdp_user = user.lstrip(".\\")
+    domain = _sanitize_remmina_field((domain or "").strip())
+    rdp_user = _sanitize_remmina_field(user.lstrip(".\\"))
     if domain:
-        rdp_user = user
+        rdp_user = _sanitize_remmina_field(user)
+    safe_password = _sanitize_remmina_field(password, max_len=512)
     lines = [
         "[remmina]",
         "name=Pettie SSH Client",
         "protocol=RDP",
-        f"server={host}",
+        f"server={_sanitize_remmina_field(host)}",
         f"port={int(port)}",
         f"username={rdp_user}",
-        f"password={password}",
-        "domain=" + (domain if domain else ""),
+        f"password={safe_password}",
+        "domain=" + domain,
         "security=ntlm",
         "window_maximize=0",
         "scale=1",
@@ -576,17 +609,9 @@ def _launch_remmina(host, port, user, password, domain="", client_ref="remmina",
         cmd = [client_ref, "-c", path]
         label = "Remmina"
 
-    _popen_rdp_process(cmd, check_exit=False, gui_window=True)
+    proc, _ = _popen_rdp_process(cmd, check_exit=False, gui_window=True)
     _try_focus_rdp_window()
-
-    def _remove_profile():
-        time.sleep(8)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-    threading.Thread(target=_remove_profile, daemon=True).start()
+    _schedule_remmina_profile_cleanup(path, proc=proc)
     return True, label
 
 

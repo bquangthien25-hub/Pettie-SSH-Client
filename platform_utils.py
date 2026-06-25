@@ -1,5 +1,6 @@
 """Nhận diện hệ điều hành máy đang chạy app (local) và nhãn hiển thị."""
 
+import json
 import os
 import platform
 import shlex
@@ -89,10 +90,11 @@ def launch_system_terminal(argv):
 
     if sys.platform == "darwin":
         cmd = " ".join(shlex.quote(str(x)) for x in argv)
+        script_literal = json.dumps(cmd)
         try:
             subprocess.Popen([
                 "osascript", "-e",
-                f'tell application "Terminal" to do script "{cmd}"',
+                f"tell application \"Terminal\" to do script {script_literal}",
             ])
             return True, "Terminal"
         except OSError as e:
