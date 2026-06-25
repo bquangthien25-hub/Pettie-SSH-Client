@@ -35,11 +35,16 @@ def _ensure_dir():
     secure_ensure_store_dir()
 
 
+_MAX_JSON_BYTES = 512_000
+
+
 def _load(path, default):
     _ensure_dir()
     if not os.path.isfile(path):
         return default
     try:
+        if os.path.getsize(path) > _MAX_JSON_BYTES:
+            return default
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
@@ -53,8 +58,66 @@ def _save(path, data):
     secure_chmod(path)
 
 
+def _sanitize_profile(entry):
+    """Lọc profile từ đĩa — chống JSON bị sửa tay."""
+    if not isinstance(entry, dict):
+        return None
+    from security_utils import (
+        validate_profile_name,
+        validate_ssh_host,
+        validate_ssh_user,
+        validate_ssh_port,
+        validate_ssh_key_path,
+    )
+    name = (entry.get("name") or "").strip()
+    try:
+        name = validate_profile_name(name)
+    except ValueError:
+        return None
+    host = (entry.get("host") or "").strip()
+    dns_host = (entry.get("dns_host") or "").strip()
+    user = (entry.get("user") or "").strip()
+    port_raw = str(entry.get("port") or "22").strip() or "22"
+    key_path = (entry.get("key_path") or "").strip()
+    try:
+        if host:
+            host = validate_ssh_host(host)
+        if dns_host:
+            dns_host = validate_ssh_host(dns_host)
+        if user:
+            user = validate_ssh_user(user)
+        port = str(validate_ssh_port(port_raw))
+        if key_path:
+            key_path = validate_ssh_key_path(key_path)
+    except ValueError:
+        return None
+    notes = str(entry.get("notes") or "")[:500]
+    protocol = entry.get("protocol") or ("rdp" if port == "3389" else "ssh")
+    if protocol not in ("ssh", "rdp"):
+        protocol = "ssh"
+    return {
+        "name": name,
+        "host": host,
+        "dns_host": dns_host,
+        "port": port,
+        "user": user,
+        "protocol": protocol,
+        "key_path": key_path,
+        "notes": notes,
+        "updated": str(entry.get("updated") or "")[:32],
+    }
+
+
 def list_profiles():
-    return _load(PROFILES_FILE, [])
+    raw = _load(PROFILES_FILE, [])
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for entry in raw:
+        clean = _sanitize_profile(entry)
+        if clean:
+            out.append(clean)
+    return out
 
 
 def save_profile(name, host, port, user, notes="", key_path="", dns_host=""):

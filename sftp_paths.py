@@ -5,6 +5,27 @@ import re
 _WIN_DRIVE_RE = re.compile(r"^/?([A-Za-z]):", re.IGNORECASE)
 
 
+def safe_sftp_entry_name(name: str):
+    """
+    Tên file/thư mục SFTP an toàn — chặn path traversal từ server độc hại.
+    Trả về None nếu không hợp lệ.
+    """
+    name = (name or "").strip()
+    if not name or name in (".", ".."):
+        return None
+    if "\x00" in name:
+        return None
+    normalized = name.replace("\\", "/")
+    if "/" in normalized:
+        return None
+    for part in normalized.split("/"):
+        if part in ("", ".", ".."):
+            return None
+    if len(name) > 255:
+        return None
+    return name
+
+
 def is_windows_sftp_path(path: str) -> bool:
     if not path:
         return False
@@ -52,9 +73,10 @@ def parent_windows_sftp(path: str) -> str:
 
 def join_windows_sftp(base: str, name: str) -> str:
     base = normalize_windows_sftp(base)
-    name = (name or "").replace("\\", "/").strip("/")
-    if not name:
-        return base
+    safe = safe_sftp_entry_name(name)
+    if not safe:
+        raise ValueError("Tên file/thư mục SFTP không hợp lệ.")
+    name = safe
     if base == "/":
         if re.match(r"^[A-Za-z]:?$", name, re.IGNORECASE):
             return _drive_root(name)

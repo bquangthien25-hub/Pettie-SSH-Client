@@ -19,6 +19,7 @@ from sftp_paths import (
     join_windows_sftp,
     normalize_windows_sftp,
     parent_windows_sftp,
+    safe_sftp_entry_name,
 )
 from platform_utils import detect_local_os, format_os_display
 from security_utils import validate_remote_entry_name, validate_search_pattern
@@ -317,6 +318,11 @@ class FilePane(QFrame):
         return p if p.startswith("/") else f"/{p}"
 
     def _join(self, base, name):
+        if self.pane_id == "remote":
+            safe = safe_sftp_entry_name(name)
+            if not safe:
+                raise ValueError("Tên file/thư mục không hợp lệ.")
+            name = safe
         if self._is_win_remote() or is_windows_sftp_path(base):
             return join_windows_sftp(base, name)
         if self.pane_id == "local":
@@ -467,7 +473,11 @@ class FilePane(QFrame):
             self.go_up()
             return
         if entry["is_dir"]:
-            self._go_to(self._join(self.current_path, entry["name"]))
+            try:
+                self._go_to(self._join(self.current_path, entry["name"]))
+            except ValueError:
+                pass
+            return
 
     def selected_entries(self):
         result = []
@@ -729,8 +739,12 @@ class SftpFileManagerWindow(QMainWindow):
         dest = self.remote_pane.current_path
         tasks = []
         for entry in files:
-            local = self.local_pane._join(self.local_pane.current_path, entry["name"])
-            remote = self.remote_pane._join(dest, entry["name"])
+            try:
+                local = self.local_pane._join(self.local_pane.current_path, entry["name"])
+                remote = self.remote_pane._join(dest, entry["name"])
+            except ValueError as e:
+                QMessageBox.warning(self, "Upload", str(e))
+                return
             tasks.append((local, remote, entry["name"], entry.get("size", 0)))
         self._start_transfer(tasks, "upload")
 
@@ -743,8 +757,12 @@ class SftpFileManagerWindow(QMainWindow):
         dest = self.local_pane.current_path
         tasks = []
         for entry in files:
-            remote = self.remote_pane._join(self.remote_pane.current_path, entry["name"])
-            local = self.local_pane._join(dest, entry["name"])
+            try:
+                remote = self.remote_pane._join(self.remote_pane.current_path, entry["name"])
+                local = self.local_pane._join(dest, entry["name"])
+            except ValueError as e:
+                QMessageBox.warning(self, "Download", str(e))
+                return
             tasks.append((local, remote, entry["name"], entry.get("size", 0)))
         self._start_transfer(tasks, "download")
 
@@ -752,7 +770,12 @@ class SftpFileManagerWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "Thư mục mới", "Tên thư mục trên máy chủ:")
         if not ok or not name.strip():
             return
-        remote = self.remote_pane._join(self.remote_pane.current_path, name.strip())
+        try:
+            name = validate_remote_entry_name(name)
+            remote = self.remote_pane._join(self.remote_pane.current_path, name)
+        except ValueError as e:
+            QMessageBox.warning(self, "Thư mục mới", str(e))
+            return
         if self.ssh.mkdir(remote):
             self.remote_pane.refresh()
         else:
@@ -770,7 +793,10 @@ class SftpFileManagerWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         for entry in entries:
-            remote = self.remote_pane._join(self.remote_pane.current_path, entry["name"])
+            try:
+                remote = self.remote_pane._join(self.remote_pane.current_path, entry["name"])
+            except ValueError:
+                continue
             if entry["is_dir"]:
                 self.ssh.remove_dir(remote)
             else:

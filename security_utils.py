@@ -14,7 +14,10 @@ _SSH_HOST_RE = re.compile(
     r"|localhost|\[[0-9a-fA-F:]+\])$",
 )
 _WIN_LOGON_RE = re.compile(r"^(?:[a-zA-Z0-9._-]+\\)?[a-zA-Z0-9._@-]{1,128}$")
+_RDP_DOMAIN_RE = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
+_PROFILE_NAME_RE = re.compile(r"^[a-zA-Z0-9._ -]{1,64}$")
 _CMD_METACHAR_RE = re.compile(r'[&|<>^%!\r\n;]')
+_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
 
 
 def validate_ssh_port(port) -> int:
@@ -61,6 +64,77 @@ def validate_windows_logon(name: str) -> str:
     if not name or not _WIN_LOGON_RE.match(name):
         raise ValueError("Tên đăng nhập Windows không hợp lệ.")
     return name
+
+
+def validate_rdp_domain(domain: str) -> str:
+    """Domain RDP — chặn ký tự phá argv xfreerdp (/d:...)."""
+    domain = (domain or "").strip()
+    if not domain or domain in (".", ""):
+        return ""
+    if not _RDP_DOMAIN_RE.match(domain):
+        raise ValueError("Domain RDP không hợp lệ.")
+    return domain
+
+
+def validate_profile_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name or not _PROFILE_NAME_RE.match(name):
+        raise ValueError("Tên profile không hợp lệ.")
+    return name
+
+
+def validate_user_image_path(path: str) -> str:
+    """Ảnh nền tùy chỉnh — chỉ file ảnh trong phạm vi kích thước hợp lý."""
+    path = (path or "").strip()
+    if not path:
+        return ""
+    resolved = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(resolved):
+        raise ValueError("File ảnh nền không tồn tại.")
+    try:
+        if os.path.islink(resolved):
+            raise ValueError("Không dùng symlink làm ảnh nền.")
+    except OSError:
+        pass
+    ext = os.path.splitext(resolved)[1].lower()
+    if ext not in _IMAGE_EXTS:
+        raise ValueError("Ảnh nền phải là PNG, JPG, WEBP, GIF hoặc BMP.")
+    try:
+        size = os.path.getsize(resolved)
+    except OSError:
+        raise ValueError("Không đọc được file ảnh nền.") from None
+    if size > 20 * 1024 * 1024:
+        raise ValueError("File ảnh nền quá lớn (tối đa 20 MB).")
+    return resolved
+
+
+def is_loopback_or_linklocal_ip(ip: str) -> bool:
+    """IPv4 loopback / link-local — chặn DNS redirect nguy hiểm."""
+    if not _IPV4_RE.match(ip or ""):
+        return False
+    parts = [int(x) for x in ip.split(".")]
+    if parts[0] == 127:
+        return True
+    if parts[0] == 169 and parts[1] == 254:
+        return True
+    if ip == "0.0.0.0":
+        return True
+    return False
+
+
+def validate_server_pushed_dns(hostname: str) -> str:
+    """
+    Hostname DNS do server SSH publish — chặt hơn nhập tay.
+    Không cho localhost; sau resolve phải không phải loopback/link-local.
+    """
+    hostname = validate_ssh_host((hostname or "").strip())
+    if hostname.lower() in ("localhost",):
+        raise ValueError("DNS từ server không hợp lệ.")
+    from dns_utils import resolve_ipv4
+    resolved = resolve_ipv4(hostname)
+    if resolved and is_loopback_or_linklocal_ip(resolved):
+        raise ValueError("DNS từ server trỏ về địa chỉ nội bộ không an toàn.")
+    return hostname
 
 
 def validate_forward_host(host: str) -> str:

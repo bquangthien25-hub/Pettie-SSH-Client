@@ -44,10 +44,10 @@ from security_utils import (
     validate_ssh_user,
     validate_ssh_port,
     validate_ssh_key_path,
+    validate_profile_name,
     validate_windows_logon,
 )
 from host_key_store import (
-    peek_host_key_status,
     verify_host_key_live,
     trust_host_key,
 )
@@ -90,9 +90,6 @@ class _SSHConnectWorker(QThread):
         self._ui_bridge = ui_bridge
 
     def _ensure_host_key_trusted(self):
-        disk_status, _, _, _ = peek_host_key_status(self._host, self._port)
-        if disk_status == "trusted":
-            return True, ""
         try:
             status, fp, old_fp, key = verify_host_key_live(
                 self._host, self._port, timeout=4,
@@ -1013,8 +1010,14 @@ class PettieSSHClient(QWidget):
             update_profile_fields(name, **fields)
 
     def _apply_remote_dns_to_form(self, remote_dns):
+        from security_utils import validate_server_pushed_dns
         remote_dns = (remote_dns or "").strip()
         if not remote_dns:
+            return
+        try:
+            remote_dns = validate_server_pushed_dns(remote_dns)
+        except ValueError:
+            self.log_info("Bỏ qua DNS từ server — hostname không hợp lệ hoặc không an toàn.")
             return
         self._connect_form["dns"] = remote_dns
         info, _ = self._prepare_connect_target(require_host=False)
@@ -1501,6 +1504,12 @@ class PettieSSHClient(QWidget):
         )
         if not path:
             return
+        from security_utils import validate_user_image_path
+        try:
+            path = validate_user_image_path(path)
+        except ValueError as e:
+            QMessageBox.warning(self, tr("warn_title"), str(e))
+            return
         save_config({"custom_background_path": path})
         self._custom_bg_path = path
         self._selected_bg_id = "__custom__"
@@ -1524,6 +1533,15 @@ class PettieSSHClient(QWidget):
         custom = get_config().get("custom_background_path") or getattr(
             self, "_custom_bg_path", None
         )
+        if custom:
+            from security_utils import validate_user_image_path
+            try:
+                custom = validate_user_image_path(custom)
+            except ValueError:
+                custom = ""
+                save_config({"custom_background_path": ""})
+                self._custom_bg_path = None
+                self._update_custom_bg_label()
         if custom and os.path.exists(custom):
             return custom
         if custom:
@@ -1755,6 +1773,11 @@ class PettieSSHClient(QWidget):
             QMessageBox.warning(
                 self, tr("profile_title"), tr("warn_profile_host"),
             )
+            return
+        try:
+            name = validate_profile_name(name)
+        except ValueError as e:
+            QMessageBox.warning(self, tr("profile_title"), str(e))
             return
         port = self._connect_form["port"].strip() or "22"
         user = self._connect_form["user"].strip()

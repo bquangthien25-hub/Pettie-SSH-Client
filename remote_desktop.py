@@ -20,6 +20,7 @@ from profile_store import get_settings, save_settings, secure_chmod
 from dns_utils import prepare_connect_host, is_ipv4, resolve_ipv4
 from security_utils import (
     validate_rdp_ipv4,
+    validate_rdp_domain,
     validate_ssh_host,
     validate_ssh_port,
     validate_windows_logon,
@@ -1350,6 +1351,8 @@ def _freerdp_flags(
     host, port, user, domain, sec="nla", fullscreen=False,
     local_account=False,
 ):
+    user = validate_windows_logon(user)
+    domain = validate_rdp_domain(domain) if domain else ""
     win_w, win_h, session_w, session_h = _freerdp_geometry(fullscreen)
     flags = [
         f"/v:{host}:{port}",
@@ -1617,6 +1620,7 @@ def connect_direct_rdp(
         rdp_host = validate_ssh_host(rdp_host)
         user = validate_windows_logon(user)
         port = validate_ssh_port(port)
+        domain = validate_rdp_domain(domain)
     except ValueError as exc:
         return False, str(exc)
 

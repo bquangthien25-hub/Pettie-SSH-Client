@@ -45,34 +45,59 @@ def resolve_ipv4(host: str, timeout: float = 5.0) -> str:
         return ""
 
 
+def _clean_dns_hostname(val: str) -> str:
+    """Chuẩn hóa hostname DNS — chặn IP và localhost."""
+    parts = (val or "").splitlines()
+    if not parts:
+        return ""
+    val = parts[0].strip()[:253]
+    if not val or is_ipv4(val) or val.lower() == "localhost":
+        return ""
+    return val
+
+
 def parse_remote_dns_payload(text: str) -> str:
     """Đọc hostname từ file dns.host hoặc dns.json trên server."""
     text = (text or "").strip()
     if not text:
         return ""
+    if len(text) > 512:
+        text = text[:512]
     if text.startswith("{"):
         try:
             data = json.loads(text)
             if isinstance(data, dict):
                 for key in ("host", "dns", "hostname", "name"):
-                    val = (data.get(key) or "").strip()
-                    if val and not is_ipv4(val):
+                    val = _clean_dns_hostname(data.get(key) or "")
+                    if val:
                         return val
         except (json.JSONDecodeError, TypeError):
             pass
+        return ""
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("{"):
-            return parse_remote_dns_payload(line)
+            try:
+                data = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(data, dict):
+                for key in ("host", "dns", "hostname", "name"):
+                    val = _clean_dns_hostname(data.get(key) or "")
+                    if val:
+                        return val
+            continue
         if "=" in line:
             _, _, val = line.partition("=")
-            val = val.strip().strip('"').strip("'")
-            if val and not is_ipv4(val):
+            val = _clean_dns_hostname(val.strip().strip('"').strip("'"))
+            if val:
                 return val
-        elif not is_ipv4(line):
-            return line
+        else:
+            val = _clean_dns_hostname(line)
+            if val:
+                return val
     return ""
 
 

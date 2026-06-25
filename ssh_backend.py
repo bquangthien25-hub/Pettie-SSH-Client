@@ -10,6 +10,7 @@ from sftp_paths import (
     is_windows_sftp_path,
     join_windows_sftp,
     normalize_windows_sftp,
+    safe_sftp_entry_name,
     sftp_list_path,
 )
 
@@ -303,12 +304,15 @@ class SSHManager:
         files = self.sftp_client.listdir_attr(remote_path)
       result = []
       for f in files:
+        name = safe_sftp_entry_name(f.filename)
+        if not name:
+          continue
         is_dir = stat.S_ISDIR(f.st_mode)
         size = int(f.st_size)
         if size < 0:
           size += 1 << 32
         result.append({
-          "name": f.filename,
+          "name": name,
           "size": size,
           "is_dir": is_dir,
           "mtime": f.st_mtime,
@@ -330,7 +334,9 @@ class SSHManager:
         return
       try:
         for entry in self.sftp_client.listdir_attr(path):
-          name = entry.filename
+          name = safe_sftp_entry_name(entry.filename)
+          if not name:
+            continue
           if self.remote_os == "windows" or is_windows_sftp_path(path):
             full = join_windows_sftp(path, name)
           else:
@@ -459,7 +465,14 @@ class SSHManager:
     code, out, _ = self.exec_command(cmd, timeout=8)
     if code != 0 or not (out or "").strip():
       return ""
-    return parse_remote_dns_payload(out)
+    from security_utils import validate_server_pushed_dns
+    host = parse_remote_dns_payload(out)
+    if not host:
+      return ""
+    try:
+      return validate_server_pushed_dns(host)
+    except ValueError:
+      return ""
 
   def _parse_pettie_info(self, text):
     data = {}
