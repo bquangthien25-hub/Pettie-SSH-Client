@@ -72,6 +72,7 @@ bundle_freerdp() {
     return 0
   fi
 
+  cd "$ROOT"
   chmod +x "$OUT/bin/"* 2>/dev/null || true
   [[ -f "$OUT/bin/xfreerdp" || -f "$OUT/bin/xfreerdp3" ]]
 }
@@ -112,6 +113,7 @@ else
 fi
 
 echo "==> [4/5] PyInstaller → dist/main_gui ..."
+cd "$ROOT"
 pyinstaller --noconfirm --clean main_gui.spec
 
 echo "==> [5/5] Tạo lệnh ./pettie và shortcut menu..."
