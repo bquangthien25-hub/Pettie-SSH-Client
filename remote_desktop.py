@@ -2,6 +2,7 @@
 
 import base64
 import os
+import re
 import sys
 import subprocess
 import shutil
@@ -17,7 +18,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication, QPalette, QColor
 
 from profile_store import get_settings, save_settings, secure_chmod
-from dns_utils import prepare_connect_host, is_ipv4, resolve_ipv4
+from dns_utils import prepare_connect_host, rdp_connect_target, rdp_xfreerdp_connect_host, is_ipv4, is_hostname, resolve_ipv4
 from security_utils import (
     validate_rdp_ipv4,
     validate_rdp_domain,
@@ -38,25 +39,24 @@ from freerdp_bootstrap import (
 
 RDP_PORT = 3389
 
-# xfreerdp = cửa sổ hiển thị màn hình remote (không bắt cài Remmina)
+# xfreerdp = client RDP trực tiếp (Remmina cũng dùng FreeRDP qua plugin RDP)
 _LINUX_RDP_BINARIES = (
     "xfreerdp3",
     "xfreerdp",
     "wlfreerdp",
     "freerdp",
-    "remmina",
     "krdc",
 )
 
 _BUNDLED_FREERDP_NAMES = ("xfreerdp3", "xfreerdp", "wlfreerdp", "freerdp")
 
-_REMMINA_FLATPAK_IDS = (
-    "org.remmina.Remmina",
-    "com.remmina.Remmina",
-)
 _FREERDP_FLATPAK_IDS = (
     "com.freerdp.xfreerdp",
     "org.freerdp.xfreerdp",
+)
+_REMMINA_FLATPAK_IDS = (
+    "org.remmina.Remmina",
+    "com.remmina.Remmina",
 )
 
 
@@ -104,16 +104,16 @@ def _find_bundled_freerdp():
 
 
 def _find_linux_rdp_client():
-    """Tìm trình xem RDP — ưu tiên xfreerdp đóng gói / có sẵn trên hệ thống."""
-    bundled = _find_bundled_freerdp()
-    if bundled[1]:
-        return bundled
-    for name in _LINUX_RDP_BINARIES:
+    """Tìm xfreerdp — kết nối trực tiếp như Remmina plugin RDP (không mở Remmina)."""
+    for name in ("xfreerdp3", "xfreerdp", "wlfreerdp", "freerdp"):
         path = shutil.which(name)
         if path:
             return name, path
+    bundled = _find_bundled_freerdp()
+    if bundled[1]:
+        return bundled
     if shutil.which("flatpak"):
-        for flatpak_id in _FREERDP_FLATPAK_IDS + _REMMINA_FLATPAK_IDS:
+        for flatpak_id in _FREERDP_FLATPAK_IDS:
             try:
                 r = subprocess.run(
                     ["flatpak", "info", flatpak_id],
@@ -124,6 +124,9 @@ def _find_linux_rdp_client():
                     return "flatpak:" + flatpak_id, flatpak_id
             except (OSError, subprocess.SubprocessError):
                 pass
+    krdc = shutil.which("krdc")
+    if krdc:
+        return "krdc", krdc
     return None, None
 
 
@@ -132,8 +135,10 @@ def linux_rdp_install_hint() -> str:
 
 
 def linux_rdp_client_available():
-    """True nếu máy Linux có client RDP (xfreerdp / Remmina / Flatpak)."""
+    """True nếu máy Linux có Remmina hoặc xfreerdp."""
     if is_windows() or is_macos():
+        return True
+    if _find_remmina_client()[1]:
         return True
     return bool(_find_linux_rdp_client()[1])
 
@@ -544,12 +549,10 @@ def _find_windows_freerdp():
 
 
 def _sanitize_remmina_field(value, max_len=256):
-    """Chặn newline injection trong file cấu hình Remmina."""
     return (value or "").replace("\n", "").replace("\r", "")[:max_len]
 
 
 def _secure_remove_file(path):
-    """Ghi đè rồi xóa file tạm chứa dữ liệu nhạy cảm."""
     try:
         if os.path.isfile(path):
             size = os.path.getsize(path)
@@ -574,9 +577,30 @@ def _schedule_remmina_profile_cleanup(path, proc=None, max_wait=3600):
     threading.Thread(target=worker, daemon=True).start()
 
 
+def _find_remmina_client():
+    """Remmina native hoặc Flatpak."""
+    path = shutil.which("remmina")
+    if path:
+        return "remmina", path, None
+    if shutil.which("flatpak"):
+        for flatpak_id in _REMMINA_FLATPAK_IDS:
+            try:
+                r = subprocess.run(
+                    ["flatpak", "info", flatpak_id],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if r.returncode == 0:
+                    return "flatpak:" + flatpak_id, flatpak_id, flatpak_id
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return None, None, None
+
+
 def _launch_remmina(host, port, user, password, domain="", client_ref="remmina", flatpak_id=None):
     """
-    Mở Remmina với profile tạm (IP + user + pass) — giống bấm Connect trong Remmina.
+    Mở RDP qua Remmina engine (profile tạm) — chạy nền, chỉ hiện cửa sổ remote.
+    Cách này ổn định hơn gọi xfreerdp thủ công trên nhiều máy Linux.
     """
     domain = _sanitize_remmina_field((domain or "").strip())
     rdp_user = _sanitize_remmina_field(user.lstrip(".\\"))
@@ -592,7 +616,7 @@ def _launch_remmina(host, port, user, password, domain="", client_ref="remmina",
         f"username={rdp_user}",
         f"password={safe_password}",
         "domain=" + domain,
-        "security=ntlm",
+        "security=auto",
         "window_maximize=0",
         "scale=1",
         "disableclipboard=0",
@@ -605,15 +629,13 @@ def _launch_remmina(host, port, user, password, domain="", client_ref="remmina",
 
     if flatpak_id:
         cmd = ["flatpak", "run", flatpak_id, "-c", path]
-        label = "Remmina (Flatpak)"
     else:
         cmd = [client_ref, "-c", path]
-        label = "Remmina"
 
-    proc, _ = _popen_rdp_process(cmd, check_exit=False, gui_window=True)
+    proc, _, _ = _popen_rdp_process(cmd, check_exit=False, gui_window=True)
     _try_focus_rdp_window()
     _schedule_remmina_profile_cleanup(path, proc=proc)
-    return True, label
+    return True, "Remote Desktop"
 
 
 def _try_focus_rdp_window():
@@ -635,15 +657,45 @@ def _try_focus_rdp_window():
 
 
 def _write_password_stdin(proc, password):
-    """Ghi pass sau khi xfreerdp sẵn sàng đọc /from-stdin."""
-    time.sleep(0.35)
+    """Ghi pass cho /from-stdin — thử vài lần vì xfreerdp đôi khi đọc chậm."""
+    payload = (password + "\n").encode("utf-8")
+    for delay in (0.15, 0.35, 0.7, 1.2):
+        time.sleep(delay)
+        if proc.poll() is not None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.write(payload)
+                proc.stdin.flush()
+        except OSError:
+            pass
     try:
-        if proc.stdin and proc.poll() is None:
-            proc.stdin.write((password + "\n").encode("utf-8"))
-            proc.stdin.flush()
+        if proc.stdin:
             proc.stdin.close()
     except OSError:
         pass
+
+
+def _start_stderr_drain(proc):
+    """Đọc stderr nền — tránh xfreerdp bị kẹt khi buffer đầy."""
+    chunks = []
+
+    def _drain():
+        try:
+            if proc.stderr:
+                chunks.append(proc.stderr.read() or b"")
+        except OSError:
+            pass
+
+    threading.Thread(target=_drain, daemon=True).start()
+    return chunks
+
+
+def _read_drained_stderr(chunks):
+    try:
+        return b"".join(chunks).decode(errors="replace").strip()
+    except Exception:
+        return ""
 
 
 def _popen_rdp_process(args, check_exit=True, password=None, gui_window=True):
@@ -662,6 +714,7 @@ def _popen_rdp_process(args, check_exit=True, password=None, gui_window=True):
         stderr=subprocess.PIPE,
         env=env,
     )
+    stderr_chunks = _start_stderr_drain(proc)
     if password and proc.stdin:
         threading.Thread(
             target=_write_password_stdin,
@@ -669,16 +722,46 @@ def _popen_rdp_process(args, check_exit=True, password=None, gui_window=True):
             daemon=True,
         ).start()
     if not check_exit:
-        return proc, None
+        return proc, None, stderr_chunks
     time.sleep(0.6)
     if proc.poll() is None:
-        return proc, None
-    err = ""
-    try:
-        err = (proc.stderr.read() or b"").decode(errors="replace").strip()
-    except OSError:
-        pass
-    return proc, err or "Client RDP thoát ngay (sai user/domain hoặc máy không mở port 3389)."
+        return proc, None, stderr_chunks
+    err = _read_drained_stderr(stderr_chunks)
+    return proc, err or "Client RDP thoát ngay (sai user/domain hoặc máy không mở port 3389).", stderr_chunks
+
+
+def _is_rdp_kerberos_error(err_text):
+    """Chỉ lỗi Kerberos AD thật — bỏ qua log krb5 nền của FreeRDP."""
+    if not err_text:
+        return False
+    low = err_text.lower()
+    return "cannot find kdc for realm" in low
+
+
+def _is_rdp_auth_failure(err_text):
+    """Lỗi sai user/password — không retry (tránh nhấp nháy cửa sổ xfreerdp)."""
+    if not err_text:
+        return False
+    low = err_text.lower()
+    return any(
+        m in low
+        for m in (
+            "authentication only",
+            "connect_cancelled",
+            "logon failure",
+            "logon_failure",
+            "errconnect_logon_failure",
+            "auth failure",
+            "access denied",
+            "login failed",
+            "password",
+            "ercauthentication",
+            "erconnect_authentication",
+            "account restriction",
+            "credentials",
+            "nla_recv_pdu",
+        )
+    )
 
 
 def _summarize_rdp_error(stderr_text):
@@ -689,22 +772,33 @@ def _summarize_rdp_error(stderr_text):
             "Kiểm tra user, password, port 3389 và Remote Desktop đã bật trên Windows."
         )
     low = stderr_text.lower()
-    if "cannot find kdc for realm" in low or "kerberos_acquirecredentials" in low:
+    if "cannot find kdc for realm" in low:
         return (
             "xfreerdp cố dùng Kerberos (Active Directory) nhưng máy đích dùng tài khoản local.\n\n"
             "• Để trống ô Domain\n"
             "• User: Administrator (hoặc tên user local)\n"
             "• Chỉ điền Domain nếu máy thật sự join domain AD"
         )
-    if "authentication only" in low or "connect_cancelled" in low:
+    if (
+        "logon failure" in low
+        or "logon_failure" in low
+        or "errconnect_logon_failure" in low
+        or "authentication only" in low
+        or "connect_cancelled" in low
+    ):
         return (
             "Xác thực RDP thất bại.\n"
             "Kiểm tra user/password, bật Remote Desktop và mở port 3389 trên Windows."
         )
     if "smart-sizing" in low and "parsing failed" in low:
         return (
-            "Lỗi tham số xfreerdp. Hãy chạy lại app bản mới nhất "
-            "hoặc thử bỏ tick «Mở toàn màn hình» rồi kết nối lại."
+            "Lỗi tham số xfreerdp (xung đột tùy chọn hiển thị).\n"
+            "Hãy cập nhật app bản mới nhất rồi thử kết nối lại."
+        )
+    if "mutually exclusive" in low:
+        return (
+            "Lỗi tham số xfreerdp (xung đột tùy chọn hiển thị).\n"
+            "Hãy cập nhật app bản mới nhất rồi thử kết nối lại."
         )
     if "errconnect" in low or "unable to connect" in low:
         return "Không kết nối tới máy đích — kiểm tra IP, firewall và port 3389."
@@ -1197,16 +1291,22 @@ class RemoteDesktopDialog(QDialog):
             return
 
         dns_name = self.ssh_host if self.ssh_host and not is_ipv4(self.ssh_host) else ""
-        info = prepare_connect_host(ip, dns_name, require_resolve=False)
+        if not dns_name and is_hostname(ip):
+            dns_name = ip
+        info = prepare_connect_host(
+            ip if is_ipv4(ip) else "",
+            dns_name,
+            require_resolve=False,
+        )
         if info.get("error"):
             _rdp_warning(self, "DNS", info["error"])
             return
+        rdp_target = rdp_connect_target(info) or ip
         if info.get("resolved_ip") and info["resolved_ip"] != ip:
             ip = info["resolved_ip"]
             self.txt_ip.setText(ip)
-        connect_target = info.get("connect_host") or ip
 
-        user_ip = self._normalize_ip(connect_target if dns_name else ip)
+        user_ip = self._normalize_ip(rdp_target)
         rdp_address = self._rdp_address(user_ip)
 
         self.lbl_status.setText("Đang xác thực...")
@@ -1275,10 +1375,9 @@ class RemoteDesktopDialog(QDialog):
             if detail is None:
                 hint = linux_rdp_install_hint()
                 summary = (
-                    "Không tìm thấy ứng dụng RDP trên máy Linux.\n\n"
-                    "Cài một trong các gói sau rồi thử lại:\n"
-                    f"  • {hint}\n"
-                    "  • sudo dnf install remmina"
+                    "Không tìm thấy xfreerdp trên máy Linux.\n\n"
+                    "Cài FreeRDP rồi thử lại:\n"
+                    f"  • {hint}"
                 )
                 _rdp_warning(self, "Lỗi RDP", summary)
             else:
@@ -1347,150 +1446,250 @@ def _freerdp_geometry(fullscreen=False):
     return win_w, win_h, session_w, session_h
 
 
-def _freerdp_flags(
-    host, port, user, domain, sec="nla", fullscreen=False,
-    local_account=False,
+_FREERDP_SEC_MODES = ("auto", "nla", "tls", "rdp")
+_FREERDP_START_TIMEOUT = 3.5
+
+
+def _freerdp_password_arg(password):
+    """Trả về (flag, cần_stdin). /p: ổn định hơn /from-stdin với FreeRDP 3."""
+    pwd = password or ""
+    if not pwd:
+        return "/from-stdin", True
+    if re.match(r"^[^\s:/\\\"']+$", pwd):
+        return f"/p:{pwd}", False
+    return "/from-stdin", True
+
+
+def _freerdp_flags_simple(host, port, user, password, domain="", fullscreen=False):
+    """xfreerdp tối giản — giống Remmina (security=auto, không ép Kerberos/NTLM)."""
+    user = validate_windows_logon(user.lstrip(".\\"))
+    domain = validate_rdp_domain(domain) if domain else ""
+    pwd_flag, _ = _freerdp_password_arg(password)
+    _, _, session_w, session_h = _freerdp_geometry(fullscreen)
+    flags = [
+        f"/v:{host}:{port}",
+        f"/u:{user}",
+        pwd_flag,
+        "/cert:tofu",
+        "+clipboard",
+        "/sound:off",
+    ]
+    if domain:
+        flags.append(f"/d:{domain}")
+    if fullscreen:
+        flags.append("/f")
+    else:
+        flags.append(f"/size:{session_w}x{session_h}")
+        flags.append("/smart-sizing")
+    return flags
+
+
+def _run_freerdp_simple(
+    client_ref, host, port, user, password, domain="",
+    fullscreen=False, flatpak_id=None,
 ):
+    _, use_stdin = _freerdp_password_arg(password)
+    flags = _freerdp_flags_simple(
+        host, port, user, password, domain, fullscreen=fullscreen,
+    )
+    if flatpak_id:
+        args = ["flatpak", "run", flatpak_id] + flags
+    else:
+        args = [client_ref] + flags
+    proc, err, stderr_chunks = _popen_rdp_process(
+        args,
+        password=password if use_stdin else None,
+        check_exit=False,
+        gui_window=True,
+    )
+    if err:
+        return err
+    err = _wait_freerdp_start(proc, stderr_chunks)
+    if err:
+        return err
+    _try_focus_rdp_window()
+    return None
+
+
+def _freerdp_local_auth_flag():
+    """Tài khoản Windows local — tắt Kerberos, chỉ NTLM (tránh lỗi KDC với hostname FQDN)."""
+    return "/auth-pkg-list:!kerberos,ntlm"
+
+
+def _freerdp_flags(
+    host, port, user, domain, sec="auto", fullscreen=False,
+    use_ntlm_auth=False, password="",
+):
+    """
+    Tham số xfreerdp giống Remmina (security=auto, scale, clipboard).
+    sec=auto → để FreeRDP negotiate (mặc định /nego bật), không ép /sec:nla.
+    """
     user = validate_windows_logon(user)
     domain = validate_rdp_domain(domain) if domain else ""
+    if use_ntlm_auth and "\\" not in user:
+        user = f".\\{user.lstrip('.\\\\')}"
+    pwd_flag, _ = _freerdp_password_arg(password)
     win_w, win_h, session_w, session_h = _freerdp_geometry(fullscreen)
     flags = [
         f"/v:{host}:{port}",
         f"/u:{user}",
-        "/from-stdin",
+        pwd_flag,
         "/cert:tofu",
-        f"/sec:{sec}",
-        "/scale:100",
-        "/network:auto",
-        "/auto-reconnect",
-        f"/size:{session_w}x{session_h}",
-        f"/smart-sizing:{win_w}x{win_h}",
         "+clipboard",
         "/sound:off",
+        "/network:auto",
     ]
+    if sec and sec != "auto":
+        flags.append(f"/sec:{sec}")
     if domain and domain not in (".", ""):
         flags.append(f"/d:{domain}")
-    elif local_account:
-        flags.append("/auth-pkg-list:ntlm")
+    elif use_ntlm_auth:
+        flags.append(_freerdp_local_auth_flag())
     if fullscreen:
         flags.append("/f")
         flags.append("/floatbar:sticky:on,default:visible,show:fullscreen")
+    else:
+        flags.append(f"/size:{session_w}x{session_h}")
+        # FreeRDP 3: smart-sizing và dynamic-resolution loại trừ nhau — chỉ dùng smart-sizing.
+        flags.append("/smart-sizing")
     return flags
+
+
+def _wait_freerdp_start(proc, stderr_chunks, timeout=_FREERDP_START_TIMEOUT):
+    """Chờ xfreerdp khởi động — thoát sớm nếu process chết, không block lâu."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if proc.poll() is not None:
+            time.sleep(0.1)
+            err = _read_drained_stderr(stderr_chunks)
+            return err or "xfreerdp thoát sớm — kiểm tra user, password và port 3389."
+        time.sleep(0.1)
+    if proc.poll() is not None:
+        time.sleep(0.1)
+        err = _read_drained_stderr(stderr_chunks)
+        return err or "xfreerdp thoát sớm — kiểm tra user, password và port 3389."
+    return None
 
 
 def _rdp_login_attempts(user, domain=""):
     """
-    Thứ tự thử đăng nhập — tài khoản local Windows (không AD) trước.
-    Tránh /d:. vì dễ kích hoạt Kerberos trên xfreerdp.
+    Các lần thử đăng nhập — giống Remmina «Security: Negotiate / auto».
+    Tài khoản local (Domain trống): luôn NTLM, ưu tiên NLA trước.
     """
     user = (user or "").strip()
     domain = (domain or "").strip()
     if domain and domain not in (".", ""):
-        return [
-            (user, domain, "nla"),
-            (user, domain, "tls"),
-        ]
-    if "\\" in user:
-        return [(user, "", "nla"), (user, "", "tls")]
-    base = user.lstrip(".\\")
-    return [
-        (f".\\{base}", "", "nla"),
-        (base, "", "nla"),
-        (base, "", "tls"),
-        (f".\\{base}", "", "tls"),
-    ]
+        base_user = user
+    elif "\\" in user:
+        base_user = user
+        domain = ""
+    else:
+        base_user = user.lstrip(".\\")
+        domain = ""
+    use_ntlm = not domain and "\\" not in base_user
+    sec_modes = ("nla", "auto", "tls", "rdp") if use_ntlm else _FREERDP_SEC_MODES
+    return [(base_user, domain, sec, use_ntlm) for sec in sec_modes]
 
 
 def _run_freerdp(
-    client_ref, host, port, user, password, domain, sec="nla",
-    fullscreen=False,
+    client_ref, host, port, user, password, domain, sec="auto",
+    fullscreen=False, use_ntlm_auth=False,
 ):
-    local = not domain or domain in (".", "")
+    _, use_stdin = _freerdp_password_arg(password)
     args = [client_ref] + _freerdp_flags(
         host, port, user, domain, sec=sec, fullscreen=fullscreen,
-        local_account=local,
+        use_ntlm_auth=use_ntlm_auth, password=password,
     )
-    proc, err = _popen_rdp_process(
-        args, password=password, check_exit=False, gui_window=True,
+    proc, err, stderr_chunks = _popen_rdp_process(
+        args,
+        password=password if use_stdin else None,
+        check_exit=False,
+        gui_window=True,
     )
     if err:
         return err
-    time.sleep(1.5)
-    if proc.poll() is not None:
-        try:
-            err = (proc.stderr.read() or b"").decode(errors="replace").strip()
-        except OSError:
-            err = ""
-        return err or "xfreerdp thoát sớm — kiểm tra user, password và port 3389."
+    err = _wait_freerdp_start(proc, stderr_chunks)
+    if err:
+        return err
     _try_focus_rdp_window()
     return None
 
 
 def _launch_freerdp_client(client_ref, host, port, user, password, domain, fullscreen=False):
     last_err = ""
-    for u, d, sec in _rdp_login_attempts(user, domain):
+    for u, d, sec, use_ntlm in _rdp_login_attempts(user, domain):
         last_err = _run_freerdp(
             client_ref, host, port, u, password, d, sec=sec,
-            fullscreen=fullscreen,
+            fullscreen=fullscreen, use_ntlm_auth=use_ntlm,
         )
         if not last_err:
             return True, None
+        if _is_rdp_auth_failure(last_err):
+            break
+        if _is_rdp_kerberos_error(last_err) and use_ntlm:
+            continue
     return False, last_err
 
 
 def _launch_freerdp_via_flatpak(flatpak_id, host, port, user, password, domain, fullscreen=False):
     last_err = ""
-    for u, d, sec in _rdp_login_attempts(user, domain):
-        local = not d or d in (".", "")
+    for u, d, sec, use_ntlm in _rdp_login_attempts(user, domain):
+        _, use_stdin = _freerdp_password_arg(password)
         args = ["flatpak", "run", flatpak_id] + _freerdp_flags(
             host, port, u, d, sec=sec, fullscreen=fullscreen,
-            local_account=local,
+            use_ntlm_auth=use_ntlm, password=password,
         )
-        proc, err = _popen_rdp_process(
-            args, password=password, check_exit=False, gui_window=True,
+        proc, err, stderr_chunks = _popen_rdp_process(
+            args,
+            password=password if use_stdin else None,
+            check_exit=False,
+            gui_window=True,
         )
         if err:
             last_err = err
+            if _is_rdp_auth_failure(err):
+                break
+            if _is_rdp_kerberos_error(err) and use_ntlm:
+                continue
             continue
-        time.sleep(1.5)
-        if proc.poll() is None:
+        err = _wait_freerdp_start(proc, stderr_chunks)
+        if err is None:
             _try_focus_rdp_window()
             return True, None
-        try:
-            last_err = (proc.stderr.read() or b"").decode(errors="replace").strip()
-        except OSError:
-            last_err = ""
+        last_err = err
+        if _is_rdp_auth_failure(err):
+            break
+        if _is_rdp_kerberos_error(err) and use_ntlm:
+            continue
     return False, last_err
 
 
-def _launch_linux_rdp(address, user, password, domain=""):
-    """Khởi chạy client RDP trên Linux — dùng cho kết nối trực tiếp (không SSH)."""
+def _launch_linux_rdp(address, user, password, domain="", fullscreen=False, remmina_server=""):
+    """
+    Linux: Remmina engine trước (ổn định), xfreerdp dự phòng.
+    remmina_server = hostname (DDNS); address thường là IP cho xfreerdp.
+    """
+    host, port = _parse_rdp_address(address)
+    server = (remmina_server or host).strip()
+
+    rm_kind, rm_ref, rm_flatpak = _find_remmina_client()
+    if rm_ref:
+        try:
+            ok, label = _launch_remmina(
+                server, port, user, password, domain,
+                client_ref=rm_ref if not rm_flatpak else "remmina",
+                flatpak_id=rm_flatpak,
+            )
+            if ok:
+                return ok, label
+        except OSError:
+            pass
+
     client_kind, client_ref = _find_linux_rdp_client()
     if not client_ref:
         return False, None
 
-    host, port = _parse_rdp_address(address)
     try:
-        if client_kind.startswith("flatpak:"):
-            flatpak_id = client_ref
-            if "remmina" in flatpak_id.lower():
-                return _launch_remmina(
-                    host, port, user, password, domain,
-                    flatpak_id=flatpak_id,
-                )
-
-            ok, err = _launch_freerdp_via_flatpak(
-                flatpak_id, host, port, user, password, domain,
-            )
-            if not ok:
-                return False, err
-            return True, client_kind
-
-        if client_kind == "remmina":
-            return _launch_remmina(
-                host, port, user, password, domain, client_ref=client_ref,
-            )
-
         if client_kind == "krdc":
             _popen_rdp_process(
                 [client_ref, f"rdp://{user}@{host}:{port}"],
@@ -1500,12 +1699,20 @@ def _launch_linux_rdp(address, user, password, domain=""):
             _try_focus_rdp_window()
             return True, client_kind
 
-        ok, err = _launch_freerdp_client(
-            client_ref, host, port, user, password, domain,
+        flatpak_id = client_ref if client_kind.startswith("flatpak:") else None
+        err = _run_freerdp_simple(
+            client_ref,
+            host,
+            port,
+            user,
+            password,
+            domain,
+            fullscreen=fullscreen,
+            flatpak_id=flatpak_id,
         )
-        if not ok:
+        if err:
             return False, err
-        return True, client_kind
+        return True, "xfreerdp"
     except OSError as exc:
         return False, str(exc)
 
@@ -1566,14 +1773,17 @@ def _windows_launch_rdp(address, user, password, domain="", fullscreen=True):
     return True, "mstsc"
 
 
-def _launch_rdp_client(address, user, password, domain="", fullscreen=None):
+def _launch_rdp_client(address, user, password, domain="", fullscreen=None, remmina_server=""):
     """Một điểm vào RDP — Linux, Windows và macOS."""
     if is_windows():
         return _windows_launch_rdp(address, user, password, domain)
     if is_macos():
         fs = True if fullscreen is None else fullscreen
         return _launch_macos_rdp(address, user, password, domain, fullscreen=fs)
-    return _launch_linux_rdp(address, user, password, domain)
+    fs = False if fullscreen is None else fullscreen
+    return _launch_linux_rdp(
+        address, user, password, domain, fullscreen=fs, remmina_server=remmina_server,
+    )
 
 
 def connect_direct_rdp(
@@ -1613,11 +1823,14 @@ def connect_direct_rdp(
     info = prepare_connect_host(host, dns_host, require_resolve=False)
     if info.get("error"):
         return False, info["error"]
-    connect_host = info.get("connect_host") or host or dns_host
-    rdp_host = info.get("resolved_ip") or connect_host
+    local_account = not domain
+    display_host = rdp_connect_target(info) or host or dns_host
+    connect_host = rdp_xfreerdp_connect_host(info, local_account=local_account)
+    if not connect_host:
+        connect_host = display_host
 
     try:
-        rdp_host = validate_ssh_host(rdp_host)
+        rdp_host = validate_ssh_host(connect_host)
         user = validate_windows_logon(user)
         port = validate_ssh_port(port)
         domain = validate_rdp_domain(domain)
@@ -1626,8 +1839,9 @@ def connect_direct_rdp(
 
     address = _rdp_address(rdp_host, port)
     try:
-        # Windows: luôn Full screen (mstsc tự tích — Maximize mới hoạt động).
-        launched, detail = _launch_rdp_client(address, user, password, domain)
+        launched, detail = _launch_rdp_client(
+            address, user, password, domain, remmina_server=display_host,
+        )
         if launched:
             client = detail or _rdp_client_label()
             if parent is not None:

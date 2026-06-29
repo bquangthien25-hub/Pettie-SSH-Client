@@ -15,14 +15,21 @@ _STRINGS: dict[str, dict[str, str]] = {
         "connect_setup": "Thiết lập kết nối",
         "welcome_msg": "Chào mừng đến với Pettie SSH Client",
         "field_host": "Host / IP",
+        "field_server": "Server",
         "field_dns_host": "DNS / Hostname",
+        "field_rdp_domain": "Domain",
         "field_port": "Port",
+        "field_protocol": "Loại kết nối",
+        "protocol_rdp": "Remote Desktop (RDP)",
+        "protocol_ssh": "SSH",
         "field_username": "Username",
         "field_password": "Password",
         "field_ssh_key": "SSH Key tuỳ chọn",
         "field_profile": "Profile",
-        "placeholder_host": "VD: 192.168.0.1 hoặc hostname",
+        "placeholder_host": "VD: 192.168.0.1 hoặc example.com",
+        "placeholder_server_rdp": "VD: 192.168.0.1 hoặc example.com",
         "placeholder_dns": "VD: myserver.example.com (DDNS)",
+        "placeholder_rdp_domain": "Trống = tài khoản local Windows",
         "placeholder_host_rdp": "Tùy chọn — để trống nếu đã nhập domain bên dưới",
         "placeholder_dns_rdp": "VD: myserver.example.com (máy tính remote)",
         "placeholder_port": "VD: 3389 (Remote) hoặc 22 (SSH)",
@@ -34,7 +41,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "btn_delete": "Xóa",
         "btn_ping_host": "Ping host",
         "btn_connect_ssh": "  Kết nối SSH  ",
-        "btn_connect_rdp": "  Kết nối Remote (RDP)  ",
+        "btn_connect_rdp": "  Connect  ",
+        "rdp_connect_hint": (
+            "Remote Desktop (RDP) — giống Remmina: nhập Server, Username, "
+            "Password, Domain (nếu có) rồi bấm Connect."
+        ),
         "btn_disconnect": "  Ngắt kết nối  ",
         "btn_exit": "Thoát",
         "combo_profile_empty": "— Chọn profile —",
@@ -158,20 +169,20 @@ _STRINGS: dict[str, dict[str, str]] = {
             "Kết nối màn hình máy đích dùng port 3389.\n\n"
             "Nhập port 3389 rồi bấm «Kết nối Remote (RDP)» — không cần SSH."
         ),
-        "freerdp_install_title": "Cài xfreerdp (Remote Desktop)",
+        "freerdp_install_title": "Cài Remmina (Remote Desktop)",
         "freerdp_install_body": (
-            "Để dùng Remote Desktop trên Linux, app cần xfreerdp (FreeRDP).\n\n"
+            "Để dùng Remote Desktop trên Linux, app cần Remmina.\n\n"
             "Bấm Yes để tự cài từ kho phần mềm (cần mật khẩu admin).\n"
             "Hoặc chạy một lệnh: bash install-linux.sh"
         ),
         "freerdp_install_rdp_body": (
-            "Chưa có xfreerdp để mở màn hình remote.\n\n"
+            "Chưa có Remmina để mở màn hình remote.\n\n"
             "Cài ngay từ kho phần mềm? (cần quyền admin)"
         ),
-        "freerdp_install_progress": "Đang cài xfreerdp — có thể hỏi mật khẩu hệ thống…",
-        "freerdp_install_ok": "Đã cài xfreerdp — sẵn sàng dùng Remote Desktop.",
-        "freerdp_install_fail": "Không cài được xfreerdp:\n{msg}",
-        "freerdp_install_skipped": "Bỏ qua cài xfreerdp — Remote Desktop chưa dùng được.",
+        "freerdp_install_progress": "Đang cài Remmina — có thể hỏi mật khẩu hệ thống…",
+        "freerdp_install_ok": "Đã cài Remmina — sẵn sàng dùng Remote Desktop.",
+        "freerdp_install_fail": "Không cài được Remmina:\n{msg}",
+        "freerdp_install_skipped": "Bỏ qua cài Remmina — Remote Desktop chưa dùng được.",
         "ping_title": "Ping",
         "ping_ok": "Host {host}:{port} phản hồi OK.",
         "ping_fail": "Không kết nối được: {msg}",
@@ -201,14 +212,21 @@ _STRINGS: dict[str, dict[str, str]] = {
         "connect_setup": "Connection setup",
         "welcome_msg": "Welcome to Pettie SSH Client",
         "field_host": "Host / IP",
+        "field_server": "Server",
         "field_dns_host": "DNS / Hostname",
+        "field_rdp_domain": "Domain",
         "field_port": "Port",
+        "field_protocol": "Connection",
+        "protocol_rdp": "Remote Desktop (RDP)",
+        "protocol_ssh": "SSH",
         "field_username": "Username",
         "field_password": "Password",
         "field_ssh_key": "Optional SSH key",
         "field_profile": "Profile",
-        "placeholder_host": "e.g. 192.168.0.1 or hostname",
+        "placeholder_host": "e.g. 192.168.0.1 or example.com",
+        "placeholder_server_rdp": "e.g. 192.168.0.1 or example.com",
         "placeholder_dns": "e.g. myserver.example.com (DDNS)",
+        "placeholder_rdp_domain": "Leave empty for local Windows account",
         "placeholder_host_rdp": "Optional — leave empty if domain is set below",
         "placeholder_dns_rdp": "e.g. myserver.example.com (remote computer)",
         "placeholder_port": "e.g. 3389 (Remote) or 22 (SSH)",
@@ -220,7 +238,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "btn_delete": "Delete",
         "btn_ping_host": "Ping host",
         "btn_connect_ssh": "  Connect SSH  ",
-        "btn_connect_rdp": "  Connect Remote (RDP)  ",
+        "btn_connect_rdp": "  Connect  ",
+        "rdp_connect_hint": (
+            "Remote Desktop (RDP) — like Remmina: enter Server, Username, "
+            "Password, Domain (optional), then Connect."
+        ),
         "btn_disconnect": "  Disconnect  ",
         "btn_exit": "Exit",
         "combo_profile_empty": "— Select profile —",
@@ -344,20 +366,20 @@ _STRINGS: dict[str, dict[str, str]] = {
             "Direct Remote Desktop uses port 3389.\n\n"
             "Enter port 3389 on the Connect tab and press «Connect Remote (RDP)» — no SSH required."
         ),
-        "freerdp_install_title": "Install xfreerdp (Remote Desktop)",
+        "freerdp_install_title": "Install Remmina (Remote Desktop)",
         "freerdp_install_body": (
-            "Remote Desktop on Linux requires xfreerdp (FreeRDP).\n\n"
+            "Remote Desktop on Linux requires Remmina.\n\n"
             "Click Yes to install from system packages (admin password).\n"
             "Or run one command: bash install-linux.sh"
         ),
         "freerdp_install_rdp_body": (
-            "xfreerdp is not installed.\n\n"
+            "Remmina is not installed.\n\n"
             "Install now from system packages? (admin required)"
         ),
-        "freerdp_install_progress": "Installing xfreerdp — you may be prompted for your password…",
-        "freerdp_install_ok": "xfreerdp installed — Remote Desktop is ready.",
-        "freerdp_install_fail": "Could not install xfreerdp:\n{msg}",
-        "freerdp_install_skipped": "Skipped xfreerdp install — Remote Desktop unavailable.",
+        "freerdp_install_progress": "Installing Remmina — you may be prompted for your password…",
+        "freerdp_install_ok": "Remmina installed — Remote Desktop is ready.",
+        "freerdp_install_fail": "Could not install Remmina:\n{msg}",
+        "freerdp_install_skipped": "Skipped Remmina install — Remote Desktop unavailable.",
         "ping_title": "Ping",
         "ping_ok": "Host {host}:{port} responded OK.",
         "ping_fail": "Could not connect: {msg}",

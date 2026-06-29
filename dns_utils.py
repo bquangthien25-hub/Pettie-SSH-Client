@@ -116,6 +116,49 @@ def canonicalize_dns_label(host: str, default_dns: str = DEFAULT_SERVER_DNS) -> 
     return f"{host}.{suffix}"
 
 
+def rdp_connect_target(info: dict) -> str:
+    """
+    Đích kết nối RDP/xfreerdp — ưu tiên hostname DNS (cùng logic ping),
+    fallback IPv4 khi user chỉ nhập IP trực tiếp.
+    """
+    if not info:
+        return ""
+    label = (info.get("connect_host") or "").strip()
+    ip = (info.get("resolved_ip") or "").strip()
+    if info.get("dns_host") or is_hostname(label):
+        return label or ip
+    return ip or label
+
+
+def rdp_xfreerdp_connect_host(info: dict, *, local_account: bool = False) -> str:
+    """
+    Đích /v: cho xfreerdp.
+    Tài khoản Windows local: dùng IPv4 (tránh Kerberos theo tên miền FQDN).
+    """
+    if not info:
+        return ""
+    ip = (info.get("resolved_ip") or "").strip()
+    if local_account and ip:
+        return ip
+    return rdp_connect_target(info)
+
+
+def split_rdp_server(server: str, default_dns: str = DEFAULT_SERVER_DNS) -> tuple[str, str]:
+    """
+    Remmina-style — một ô Server → (host_ip, dns_hostname).
+    IP → host; tên miền/hostname → dns.
+    """
+    server = (server or "").strip()
+    if not server:
+        return "", ""
+    server = canonicalize_dns_label(server, default_dns)
+    if is_ipv4(server):
+        return server, ""
+    if is_hostname(server):
+        return "", server
+    return server, ""
+
+
 def prepare_connect_host(
     host: str,
     dns_host: str = "",
@@ -125,7 +168,7 @@ def prepare_connect_host(
 ) -> dict:
     """
     Chuẩn bị đích kết nối — ưu tiên DNS/DDNS để bắt IP mới sau khi server cập nhật.
-    require_resolve=False: vẫn trả hostname khi DNS chưa resolve (dùng cho RDP/mstsc).
+    require_resolve=False: vẫn trả hostname khi DNS chưa resolve (RDP thử hostname trực tiếp).
     Trả về: connect_host, resolved_ip, dns_host, changed, error
     """
     host = (host or "").strip()

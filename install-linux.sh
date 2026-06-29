@@ -2,6 +2,8 @@
 # ═══════════════════════════════════════════════════════════════════
 #  Pettie SSH Client — Linux: MỘT LỆNH CÀI TẤT CẢ
 #  bash install-linux.sh
+#
+#  Remote Desktop: Remmina engine (ổn định) + xfreerdp dự phòng
 # ═══════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -77,25 +79,39 @@ bundle_freerdp() {
   [[ -f "$OUT/bin/xfreerdp" || -f "$OUT/bin/xfreerdp3" ]]
 }
 
+rdp_client_hint() {
+  if command -v remmina >/dev/null 2>&1; then
+    echo "remmina: $(command -v remmina)"
+  elif command -v flatpak >/dev/null 2>&1 && flatpak info org.remmina.Remmina &>/dev/null; then
+    echo "remmina: flatpak org.remmina.Remmina"
+  else
+    echo "remmina: chưa cài"
+  fi
+  echo "  xfreerdp: $(command -v xfreerdp 2>/dev/null || echo 'vendor/freerdp/bin (dự phòng)')"
+}
+
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
 echo "║     Pettie SSH Client — Cài đặt Linux (1 lệnh)   ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
 
-echo "==> [1/5] Cài Python + xfreerdp từ hệ thống..."
+echo "==> [1/5] Cài Python + Remmina (Remote Desktop) + xfreerdp dự phòng..."
 if command -v apt-get >/dev/null 2>&1; then
   sudo apt-get update -qq
   sudo apt-get install -y \
     python3 python3-pip python3-venv python3-dev \
+    remmina remmina-plugin-rdp \
     freerdp2-x11 libfreerdp2-2 libwinpr2-2 dpkg-dev \
-    || sudo apt-get install -y python3 python3-venv python3-pip freerdp2-x11
+    || sudo apt-get install -y \
+      python3 python3-venv python3-pip \
+      remmina remmina-plugin-rdp freerdp2-x11
 elif command -v dnf >/dev/null 2>&1; then
-  sudo dnf install -y python3 python3-pip freerdp rpm-build
+  sudo dnf install -y python3 python3-pip remmina freerdp rpm-build
 elif command -v pacman >/dev/null 2>&1; then
-  sudo pacman -S --noconfirm python python-pip freerdp2 base-devel
+  sudo pacman -S --noconfirm python python-pip remmina freerdp2 base-devel
 elif command -v zypper >/dev/null 2>&1; then
-  sudo zypper install -y python3 python3-pip freerdp
+  sudo zypper install -y python3 python3-pip remmina freerdp
 fi
 
 echo "==> [2/5] pip install -r requirements.txt ..."
@@ -105,11 +121,11 @@ source venv/bin/activate
 pip install -U pip wheel
 pip install -r requirements.txt
 
-echo "==> [3/5] Đóng gói xfreerdp vào vendor/freerdp/ ..."
+echo "==> [3/5] Đóng gói xfreerdp dự phòng vào vendor/freerdp/ (khi không có Remmina)..."
 if bundle_freerdp; then
-  echo "    OK: vendor/freerdp/bin"
+  echo "    OK: vendor/freerdp/bin (dự phòng)"
 else
-  echo "    Dùng xfreerdp hệ thống: $(command -v xfreerdp 2>/dev/null || echo 'chưa có')"
+  echo "    Bỏ qua — dùng Remmina/xfreerdp hệ thống"
 fi
 
 echo "==> [4/5] PyInstaller → dist/main_gui ..."
@@ -145,4 +161,5 @@ EOF
 
 echo ""
 echo "✓ Xong! Chạy: ./pettie  hoặc  ./dist/main_gui"
-echo "  xfreerdp: $(command -v xfreerdp 2>/dev/null || echo vendor/freerdp/bin)"
+echo "  Remote Desktop:"
+rdp_client_hint | sed 's/^/    /'

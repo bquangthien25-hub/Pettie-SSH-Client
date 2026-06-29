@@ -37,7 +37,10 @@ from profile_store import (
     get_config, save_config, update_profile_fields, refresh_all_profile_dns,
     get_default_dns_host,
 )
-from dns_utils import prepare_connect_host, refresh_profile_entry, is_hostname
+from dns_utils import (
+    prepare_connect_host, rdp_connect_target, refresh_profile_entry,
+    is_hostname, is_ipv4, split_rdp_server,
+)
 from security_utils import (
     ssh_argv,
     validate_ssh_host,
@@ -163,6 +166,49 @@ class _FreerdpInstallWorker(QThread):
         self.install_result.emit(ok, msg)
 
 
+class _RdpConnectWorker(QThread):
+    """DNS resolve + mở Remote Desktop nền — không block UI thread."""
+
+    connect_result = Signal(bool, str, object)
+
+    def __init__(self, host, dns_host, port, user, password, default_dns, rdp_domain=""):
+        super().__init__()
+        self._host = (host or "").strip()
+        self._dns_host = (dns_host or "").strip()
+        self._port = int(port)
+        self._user = user
+        self._password = password
+        self._default_dns = default_dns or ""
+        self._rdp_domain = (rdp_domain or "").strip()
+
+    def run(self):
+        info = {}
+        try:
+            info = prepare_connect_host(
+                self._host,
+                self._dns_host,
+                require_resolve=False,
+                default_dns=self._default_dns,
+            )
+            if info.get("error"):
+                self.connect_result.emit(False, info["error"], info)
+                return
+            ok, msg = connect_direct_rdp(
+                self._host,
+                self._user,
+                self._password,
+                port=self._port,
+                parent=None,
+                domain=self._rdp_domain,
+                dns_host=info.get("dns_host") or self._dns_host,
+            )
+            self.connect_result.emit(ok, msg or "", info)
+        except Exception as exc:
+            self.connect_result.emit(False, str(exc), info)
+        finally:
+            self._password = None
+
+
 class PettieSSHClient(QWidget):
     def __init__(self):
         super().__init__()
@@ -174,9 +220,11 @@ class PettieSSHClient(QWidget):
         self._child_windows = []
         self._session_history = []
         self._connect_worker = None
+        self._rdp_connect_worker = None
         self._freerdp_install_worker = None
         self._connect_progress = None
         self._pending_connect = None
+        self._pending_rdp = None
         self._connect_ui_bridge = _ConnectUiBridge(self)
         self._settings = get_settings()
         init_language(self._settings.get("language", LANG_VI))
@@ -186,7 +234,7 @@ class PettieSSHClient(QWidget):
         self._custom_bg_path = None
         self._selected_bg_id = "sakura_sky"
         self._connect_form = {
-            "host": "", "dns": "", "port": "", "user": "", "pass": "", "key": "",
+            "host": "", "dns": "", "domain": "", "port": "", "user": "", "pass": "", "key": "",
         }
         self._form_syncing = False
         self.init_ui()
@@ -317,19 +365,21 @@ class PettieSSHClient(QWidget):
         grid = QGridLayout()
         grid.setSpacing(14)
         grid.setColumnStretch(1, 1)
-        grid.addWidget(self._fl("field_host"), 0, 0)
+        self._lbl_host = self._fl("field_host")
+        grid.addWidget(self._lbl_host, 0, 0)
         self.txt_host = QLineEdit()
         grid.addWidget(self.txt_host, 0, 1, 1, 3)
-        grid.addWidget(self._fl("field_dns_host"), 1, 0)
+        self._lbl_dns = self._fl("field_dns_host")
+        grid.addWidget(self._lbl_dns, 1, 0)
         self.txt_dns = QLineEdit()
         grid.addWidget(self.txt_dns, 1, 1, 1, 3)
-        grid.addWidget(self._fl("field_port"), 2, 0)
-        self.txt_port = QLineEdit()
-        self.txt_port.setMaxLength(5)
-        self.txt_port.setClearButtonEnabled(False)
-        self.txt_port.setFixedWidth(120)
-        self.txt_port.setMinimumHeight(36)
-        grid.addWidget(self.txt_port, 2, 1, 1, 3)
+        grid.addWidget(self._fl("field_protocol"), 2, 0)
+        self.combo_protocol = QComboBox()
+        self.combo_protocol.setMinimumHeight(36)
+        self.combo_protocol.setFixedWidth(240)
+        if hasattr(self.combo_protocol, "setWheelEnabled"):
+            self.combo_protocol.setWheelEnabled(False)
+        grid.addWidget(self.combo_protocol, 2, 1, 1, 3)
         grid.addWidget(self._fl("field_username"), 3, 0)
         self.txt_user = QLineEdit()
         grid.addWidget(self.txt_user, 3, 1, 1, 3)
@@ -347,15 +397,22 @@ class PettieSSHClient(QWidget):
         pass_wrap = QWidget()
         pass_wrap.setLayout(pass_row)
         grid.addWidget(pass_wrap, 4, 1, 1, 3)
-        grid.addWidget(self._fl("field_ssh_key"), 5, 0)
+        self._lbl_domain = self._fl("field_rdp_domain")
+        grid.addWidget(self._lbl_domain, 5, 0)
+        self.txt_domain = QLineEdit()
+        grid.addWidget(self.txt_domain, 5, 1, 1, 3)
+        self._lbl_ssh_key = self._fl("field_ssh_key")
+        grid.addWidget(self._lbl_ssh_key, 6, 0)
         self.txt_key = QLineEdit()
-        btn_key = QPushButton("...")
-        btn_key.setFixedWidth(36)
-        btn_key.clicked.connect(self._browse_key)
+        self._btn_key = QPushButton("...")
+        self._btn_key.setFixedWidth(36)
+        self._btn_key.clicked.connect(self._browse_key)
         key_row = QHBoxLayout()
         key_row.addWidget(self.txt_key)
-        key_row.addWidget(btn_key)
-        grid.addLayout(key_row, 5, 1, 1, 3)
+        key_row.addWidget(self._btn_key)
+        grid.addLayout(key_row, 6, 1, 1, 3)
+        self._lbl_domain.setVisible(False)
+        self.txt_domain.setVisible(False)
         cl.addLayout(grid)
 
         prof_row = QHBoxLayout()
@@ -410,7 +467,7 @@ class PettieSSHClient(QWidget):
         row_btn.addWidget(self.btn_action)
         self._setup_connect_form_state()
         for field in (
-            self.txt_host, self.txt_dns, self.txt_user, self.txt_pass,
+            self.txt_host, self.txt_dns, self.txt_domain, self.txt_user, self.txt_pass,
         ):
             field.returnPressed.connect(self._submit_connect_form)
         row_btn.addStretch()
@@ -728,7 +785,7 @@ class PettieSSHClient(QWidget):
         self._connect_field_map = {
             "host": self.txt_host,
             "dns": self.txt_dns,
-            "port": self.txt_port,
+            "domain": self.txt_domain,
             "user": self.txt_user,
             "pass": self.txt_pass,
             "key": self.txt_key,
@@ -761,6 +818,10 @@ class PettieSSHClient(QWidget):
         for widget in self._connect_field_map.values():
             widget.installEventFilter(guard)
 
+        self.combo_protocol.currentIndexChanged.connect(self._on_protocol_changed)
+
+        self._populate_protocol_combo()
+
         app = QApplication.instance()
         if app and not getattr(self, "_focus_hooked", False):
             app.focusChanged.connect(self._on_connect_focus_changed)
@@ -785,8 +846,46 @@ class PettieSSHClient(QWidget):
         if self._form_syncing:
             return
         self._connect_form[key] = widget.text()
-        if key == "port":
-            self._update_connect_button_label()
+
+    def _on_protocol_changed(self, _index):
+        if self._form_syncing:
+            return
+        self._connect_form["port"] = self._connect_port_from_combo()
+        self._update_connect_button_label()
+
+    def _connect_port_from_combo(self):
+        data = self.combo_protocol.currentData()
+        if data is not None:
+            return str(data)
+        return str(self._default_connect_port())
+
+    def _set_connect_port_combo(self, port_text=""):
+        if self.combo_protocol.count() == 0:
+            return
+        port_text = (port_text or "").strip()
+        try:
+            port = int(port_text) if port_text else self._default_connect_port()
+        except ValueError:
+            port = self._default_connect_port()
+        idx = 0 if port == RDP_PORT else 1
+        self.combo_protocol.blockSignals(True)
+        self.combo_protocol.setCurrentIndex(idx)
+        self.combo_protocol.blockSignals(False)
+
+    def _populate_protocol_combo(self):
+        port = self._connect_form.get("port", "") or str(self._default_connect_port())
+        try:
+            port_int = int(port)
+        except ValueError:
+            port_int = self._default_connect_port()
+        idx = 0 if port_int == RDP_PORT else 1
+        self.combo_protocol.blockSignals(True)
+        self.combo_protocol.clear()
+        self.combo_protocol.addItem(tr("protocol_rdp"), str(RDP_PORT))
+        self.combo_protocol.addItem(tr("protocol_ssh"), "22")
+        self.combo_protocol.setCurrentIndex(idx)
+        self.combo_protocol.blockSignals(False)
+        self._connect_form["port"] = self._connect_port_from_combo()
 
     def _on_connect_focus_changed(self, old, _new):
         fields = set(self._connect_field_map.values())
@@ -810,6 +909,8 @@ class PettieSSHClient(QWidget):
                     widget.setText(cached)
                 elif live != cached:
                     self._connect_form[key] = live
+            self._set_connect_port_combo(self._connect_form.get("port", ""))
+            self._connect_form["port"] = self._connect_port_from_combo()
             self._update_connect_button_label()
         finally:
             self._form_syncing = False
@@ -821,15 +922,18 @@ class PettieSSHClient(QWidget):
             self._capture_connect_field_by_widget(focused)
         for key, widget in self._connect_field_map.items():
             self._connect_form[key] = widget.text()
+        self._connect_form["port"] = self._connect_port_from_combo()
 
     def _get_password(self):
         self._flush_connect_form_from_widgets()
         return self._connect_form.get("pass", "")
 
     def _init_connect_form_empty(self):
-        """Form trống khi mở app — không điền sẵn IP/domain/port."""
+        """Form trống khi mở app — không điền sẵn IP/domain."""
+        default_port = str(self._default_connect_port())
         self._connect_form = {
-            "host": "", "dns": "", "port": "", "user": "", "pass": "", "key": "",
+            "host": "", "dns": "", "domain": "", "port": default_port,
+            "user": "", "pass": "", "key": "",
         }
         clear_connection_history()
         self._session_history.clear()
@@ -838,6 +942,7 @@ class PettieSSHClient(QWidget):
                 widget.blockSignals(True)
                 widget.clear()
                 widget.blockSignals(False)
+            self._set_connect_port_combo(default_port)
             self._restore_connect_form_fields()
         self._update_connect_button_label()
         if hasattr(self, "list_history"):
@@ -1078,7 +1183,7 @@ class PettieSSHClient(QWidget):
         self.txt_host.setPlaceholderText(tr("placeholder_host"))
         if hasattr(self, "txt_dns"):
             self.txt_dns.setPlaceholderText(tr("placeholder_dns"))
-        self.txt_port.setPlaceholderText(tr("placeholder_port"))
+        self._populate_protocol_combo()
         self.txt_user.setPlaceholderText(tr("placeholder_user"))
         self.txt_pass.setPlaceholderText(tr("placeholder_pass"))
         if hasattr(self, "chk_hide_pass"):
@@ -1280,9 +1385,11 @@ class PettieSSHClient(QWidget):
         self.txt_user.clear()
         self.txt_pass.clear()
         self.txt_key.clear()
-        self.txt_port.clear()
+        default_port = str(self._default_connect_port())
+        self._set_connect_port_combo(default_port)
         self._connect_form = {
-            "host": "", "dns": "", "port": "", "user": "", "pass": "", "key": "",
+            "host": "", "dns": "", "domain": "", "port": default_port,
+            "user": "", "pass": "", "key": "",
         }
 
         if hasattr(self, "txt_log"):
@@ -1709,25 +1816,46 @@ class PettieSSHClient(QWidget):
     def _update_connect_button_label(self):
         if self.is_logged_in or not hasattr(self, "btn_action"):
             return
-        port = self._effective_connect_port()
-        if port == RDP_PORT:
-            self.btn_action.setText(tr("btn_connect_rdp"))
-            if hasattr(self, "txt_host"):
-                self.txt_host.setPlaceholderText(tr("placeholder_host_rdp"))
-            if hasattr(self, "txt_dns"):
-                self.txt_dns.setPlaceholderText(tr("placeholder_dns_rdp"))
-        elif port == 22:
-            self.btn_action.setText(tr("btn_connect_ssh"))
-            if hasattr(self, "txt_host"):
-                self.txt_host.setPlaceholderText(tr("placeholder_host"))
-            if hasattr(self, "txt_dns"):
-                self.txt_dns.setPlaceholderText(tr("placeholder_dns"))
+        rdp = self._effective_connect_port() == RDP_PORT
+        self.btn_action.setText(tr("btn_connect_rdp") if rdp else tr("btn_connect_ssh"))
+        if hasattr(self, "_lbl_host"):
+            self._lbl_host.setText(tr("field_server") if rdp else tr("field_host"))
+        if hasattr(self, "txt_host"):
+            self.txt_host.setPlaceholderText(
+                tr("placeholder_server_rdp") if rdp else tr("placeholder_host"),
+            )
+        if hasattr(self, "txt_dns"):
+            self.txt_dns.setPlaceholderText(tr("placeholder_dns"))
+        if hasattr(self, "txt_domain"):
+            self.txt_domain.setPlaceholderText(tr("placeholder_rdp_domain"))
+        if hasattr(self, "_lbl_dns"):
+            self._lbl_dns.setVisible(not rdp)
+            self.txt_dns.setVisible(not rdp)
+        if hasattr(self, "_lbl_domain"):
+            self._lbl_domain.setVisible(rdp)
+            self.txt_domain.setVisible(rdp)
+        if hasattr(self, "_lbl_ssh_key"):
+            self._lbl_ssh_key.setVisible(not rdp)
+            self.txt_key.setVisible(not rdp)
+            self._btn_key.setVisible(not rdp)
+        if rdp and hasattr(self, "lbl_connect_desc"):
+            self.lbl_connect_desc.setText(tr("rdp_connect_hint"))
+        elif hasattr(self, "lbl_connect_desc"):
+            self.lbl_connect_desc.setText(tr("welcome_msg"))
+
+    def _rdp_form_targets(self):
+        """Remmina-style: Server + Domain → host IP, DNS hostname, Windows domain."""
+        self._flush_connect_form_from_widgets()
+        server = self._connect_form.get("host", "").strip()
+        dns_extra = self._connect_form.get("dns", "").strip()
+        win_domain = self._connect_form.get("domain", "").strip()
+        dd = get_default_dns_host()
+        if dns_extra:
+            host_ip = server if is_ipv4(server) else ""
+            dns = dns_extra
         else:
-            self.btn_action.setText(tr("btn_connect_ssh"))
-            if hasattr(self, "txt_host"):
-                self.txt_host.setPlaceholderText(tr("placeholder_host"))
-            if hasattr(self, "txt_dns"):
-                self.txt_dns.setPlaceholderText(tr("placeholder_dns"))
+            host_ip, dns = split_rdp_server(server, dd)
+        return host_ip, dns, win_domain
 
     def _load_from_history(self, item):
         text = item.text()
@@ -1820,9 +1948,11 @@ class PettieSSHClient(QWidget):
             QMessageBox.warning(self, tr("warn_title"), err)
             return
         host = validate_ssh_host(info["connect_host"])
-        port_text = self._connect_form["port"].strip() or "22"
+        port_text = self._connect_form["port"].strip()
         try:
-            port = validate_ssh_port(port_text)
+            port = validate_ssh_port(
+                port_text if port_text else str(self._effective_connect_port()),
+            )
         except ValueError as e:
             QMessageBox.warning(self, tr("warn_title"), str(e))
             return
@@ -1883,7 +2013,6 @@ class PettieSSHClient(QWidget):
     def open_remote_desktop(self):
         """RDP trực tiếp — giống Windows Remote Desktop (mstsc)."""
         if self.is_logged_in:
-            host = self._connect_form.get("dns", "").strip() or self._session_host()
             user = self._session_user()
             password = self.ssh_manager.get_session_password()
             if not password:
@@ -1898,41 +2027,28 @@ class PettieSSHClient(QWidget):
                 if dlg.exec() == QDialog.DialogCode.Accepted:
                     self.log_info("Remote Desktop: đã khởi chạy client RDP.")
                 return
-            info, err = self._prepare_connect_target(require_resolve=False)
-            if err:
-                QMessageBox.warning(self, tr("warn_title"), err)
-                return
-            rdp_host = info.get("resolved_ip") or info.get("connect_host") or host
-            dns_host = info.get("dns_host") or self._connect_form.get("dns", "").strip()
-            display = dns_host or rdp_host
-            self.log_info(f"Đang mở Remote Desktop → {display}:{RDP_PORT}...")
-            ok, msg = connect_direct_rdp(
-                rdp_host, user, password, port=RDP_PORT, parent=self, dns_host=dns_host,
+            host, dns_host, rdp_domain = self._rdp_form_targets()
+            if not host and not dns_host:
+                host = self._session_host()
+                if host and not is_ipv4(host):
+                    dns_host = host
+                    host = ""
+            self._start_rdp_connect(
+                host, RDP_PORT, user, password,
+                dns_host=dns_host, rdp_domain=rdp_domain,
             )
-            if ok:
-                self.log_info(msg)
-            else:
-                QMessageBox.warning(
-                    self, tr("rdp_connect_fail"), msg or tr("rdp_connect_fail"),
-                )
             return
 
         self._flush_connect_form_from_widgets()
         user = self._connect_form["user"].strip()
         password = self._connect_form["pass"]
         port_text = self._connect_form["port"].strip()
-        info, err = self._prepare_connect_target(require_resolve=False)
-        if err:
-            QMessageBox.warning(self, tr("warn_title"), err)
-            return
-        host = info.get("resolved_ip") or info.get("connect_host", "")
-        dns_host = info.get("dns_host") or self._connect_form.get("dns", "").strip()
-        self._persist_dns_to_profile(info)
+        host, dns_host, rdp_domain = self._rdp_form_targets()
         try:
             port = int(port_text) if port_text else RDP_PORT
         except ValueError:
             port = RDP_PORT
-        if not host:
+        if not host and not dns_host:
             QMessageBox.warning(self, tr("warn_title"), tr("warn_enter_host"))
             return
         if not user:
@@ -1953,7 +2069,9 @@ class PettieSSHClient(QWidget):
         except ValueError as e:
             QMessageBox.warning(self, tr("warn_title"), str(e))
             return
-        self._connect_rdp_direct(host, port, rdp_user, password, dns_host=dns_host)
+        self._connect_rdp_direct(
+            host, port, rdp_user, password, dns_host=dns_host, rdp_domain=rdp_domain,
+        )
 
     def open_system_info(self):
         if not self._require_login():
@@ -1996,8 +2114,8 @@ class PettieSSHClient(QWidget):
 
     def _set_connect_form_enabled(self, enabled):
         for w in (
-            self.txt_host, self.txt_dns, self.txt_port, self.txt_user, self.txt_pass,
-            self.txt_key, self.btn_action,
+            self.txt_host, self.txt_dns, self.txt_domain, self.combo_protocol,
+            self.txt_user, self.txt_pass, self.txt_key, self.btn_action,
         ):
             w.setEnabled(enabled)
 
@@ -2111,15 +2229,58 @@ class PettieSSHClient(QWidget):
             self, tr("success_title"), tr("success_connected"),
         )
 
-    def _connect_rdp_direct(self, host, port, user, password, dns_host=""):
+    def _start_rdp_connect(self, host, port, user, password, dns_host="", rdp_domain=""):
+        if self._rdp_connect_worker and self._rdp_connect_worker.isRunning():
+            return
+        host = (host or "").strip()
+        dns_host = (dns_host or "").strip()
+        rdp_domain = (rdp_domain or "").strip()
+        if not host and not dns_host:
+            QMessageBox.warning(self, tr("warn_title"), tr("warn_enter_host"))
+            return
         if not self._ensure_freerdp_for_rdp():
             return
         display = dns_host or host
+        self._pending_rdp = {
+            "host": host,
+            "port": port,
+            "user": user,
+            "dns_host": dns_host,
+            "rdp_domain": rdp_domain,
+        }
         self.log_info(f"Đang mở Remote Desktop → {display}:{port}...")
-        ok, msg = connect_direct_rdp(
-            host, user, password, port=port, parent=self, dns_host=dns_host,
+        self._set_connect_form_enabled(False)
+        self._begin_connect_progress(display, port)
+        worker = _RdpConnectWorker(
+            host, dns_host, port, user, password, get_default_dns_host(), rdp_domain,
         )
+        worker.connect_result.connect(
+            self._on_rdp_connect_finished,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.finished.connect(worker.deleteLater)
+        self._rdp_connect_worker = worker
+        worker.start()
+
+    def _on_rdp_connect_finished(self, ok, message, info):
+        if self._rdp_connect_worker and not self._rdp_connect_worker.isRunning():
+            self._rdp_connect_worker = None
+        self._end_connect_progress()
+        self._set_connect_form_enabled(True)
+        pending = self._pending_rdp or {}
+        self._pending_rdp = None
+        if info:
+            if info.get("resolved_ip"):
+                self._connect_form["host"] = info["resolved_ip"]
+            if info.get("dns_host"):
+                self._connect_form["dns"] = info["dns_host"]
+            self._restore_connect_form_fields()
+            self._persist_dns_to_profile(info)
+        host = (info or {}).get("resolved_ip") or pending.get("host", "")
+        port = pending.get("port", RDP_PORT)
+        user = pending.get("user", "")
         if ok:
+            self.showMinimized()
             self._session_history.insert(0, {
                 "host": host,
                 "port": str(port),
@@ -2129,7 +2290,7 @@ class PettieSSHClient(QWidget):
             })
             self._session_history = self._session_history[:20]
             self._refresh_history_list()
-            self.log_info(msg)
+            self.log_info(message)
         else:
             self._session_history.insert(0, {
                 "host": host,
@@ -2140,12 +2301,17 @@ class PettieSSHClient(QWidget):
             })
             self._session_history = self._session_history[:20]
             self._refresh_history_list()
-            self.log_info(f"RDP: {msg}")
+            self.log_info(f"RDP: {message}")
             QMessageBox.warning(
                 self,
                 tr("rdp_connect_fail"),
-                msg or tr("rdp_connect_fail"),
+                message or tr("rdp_connect_fail"),
             )
+
+    def _connect_rdp_direct(self, host, port, user, password, dns_host="", rdp_domain=""):
+        self._start_rdp_connect(
+            host, port, user, password, dns_host=dns_host, rdp_domain=rdp_domain,
+        )
 
     def handle_action(self):
         """Kết nối SSH, RDP (port 3389) hoặc ngắt kết nối."""
@@ -2157,13 +2323,6 @@ class PettieSSHClient(QWidget):
             port_text = self._connect_form["port"].strip()
             user = self._connect_form["user"].strip()
             password = self._connect_form["pass"]
-
-            info, err = self._prepare_connect_target(
-                require_resolve=(self._effective_connect_port(port_text) != RDP_PORT),
-            )
-            if err:
-                QMessageBox.warning(self, tr("warn_title"), err)
-                return
 
             if not user:
                 QMessageBox.warning(self, tr("warn_title"), tr("warn_enter_user"))
@@ -2179,23 +2338,28 @@ class PettieSSHClient(QWidget):
                 QMessageBox.warning(self, tr("warn_title"), str(e))
                 return
 
-            self._persist_dns_to_profile(info)
-
             if port == RDP_PORT:
                 try:
                     user = validate_windows_logon(user)
                 except ValueError as e:
                     QMessageBox.warning(self, tr("warn_title"), str(e))
                     return
-                rdp_host = info.get("resolved_ip") or info.get("connect_host", "")
-                dns_host = info.get("dns_host") or self._connect_form.get("dns", "").strip()
-                if not rdp_host:
+                host, dns_host, rdp_domain = self._rdp_form_targets()
+                if not host and not dns_host:
                     QMessageBox.warning(self, tr("warn_title"), tr("warn_enter_host"))
                     return
                 self._connect_rdp_direct(
-                    rdp_host, port, user, password, dns_host=dns_host,
+                    host, port, user, password,
+                    dns_host=dns_host, rdp_domain=rdp_domain,
                 )
                 return
+
+            info, err = self._prepare_connect_target(require_resolve=True)
+            if err:
+                QMessageBox.warning(self, tr("warn_title"), err)
+                return
+
+            self._persist_dns_to_profile(info)
 
             try:
                 host = validate_ssh_host(info["connect_host"])
@@ -2252,7 +2416,7 @@ class PettieSSHClient(QWidget):
         if not self._require_login():
             return
         host = self._session_host()
-        port = self.ssh_manager._last_port or self.txt_port.text().strip() or "22"
+        port = self.ssh_manager._last_port or self._connect_port_from_combo() or "22"
         user = self._session_user()
 
         try:

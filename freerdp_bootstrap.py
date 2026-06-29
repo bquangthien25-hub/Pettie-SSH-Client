@@ -1,10 +1,11 @@
 """
-Linux — đóng gói hoặc tự cài xfreerdp cùng Pettie SSH Client.
+Linux — cài Remmina (engine RDP chính) hoặc xfreerdp dự phòng.
 
-Luồng ưu tiên:
-  1. xfreerdp đóng gói trong thư mục bin/ (+ lib/ nếu có) cạnh app
-  2. xfreerdp đã có trên PATH hệ thống
-  3. Tự cài qua apt/dnf/pacman/zypper (pkexec/sudo) khi người dùng đồng ý
+Luồng ưu tiên trong app:
+  1. Remmina (remmina -c profile) — ổn định nhất
+  2. xfreerdp trên PATH hệ thống
+  3. xfreerdp đóng gói trong vendor/freerdp/
+  4. Tự cài qua apt/dnf/pacman/zypper khi người dùng đồng ý
 """
 
 from __future__ import annotations
@@ -45,9 +46,14 @@ def find_bundled_freerdp() -> tuple[str | None, str | None]:
     Trả về (đường_dẫn_binary, thư_mục_lib hoặc None).
     """
     for base in app_base_dirs():
-        for sub in ("bin", "libexec", ""):
-            bin_dir = os.path.join(base, sub) if sub else base
-            lib_dir = os.path.join(base, "lib")
+        vendor = os.path.join(base, "vendor", "freerdp")
+        roots = (
+            (os.path.join(base, "bin"), os.path.join(base, "lib")),
+            (os.path.join(base, "libexec"), os.path.join(base, "lib")),
+            (base, os.path.join(base, "lib")),
+            (os.path.join(vendor, "bin"), os.path.join(vendor, "lib")),
+        )
+        for bin_dir, lib_dir in roots:
             if not os.path.isdir(bin_dir):
                 continue
             for name in _FREERDP_NAMES:
@@ -88,17 +94,23 @@ def detect_pkg_manager() -> str | None:
     return None
 
 
-def freerdp_packages() -> list[str]:
+def rdp_client_packages() -> list[str]:
+    """Gói cài Remote Desktop — Remmina trước, xfreerdp dự phòng."""
     pm = detect_pkg_manager()
     if pm == "apt":
-        return ["freerdp2-x11"]
+        return ["remmina", "remmina-plugin-rdp", "freerdp2-x11"]
     if pm == "dnf":
-        return ["freerdp"]
+        return ["remmina", "freerdp"]
     if pm == "pacman":
-        return ["freerdp2"]
+        return ["remmina", "freerdp2"]
     if pm == "zypper":
-        return ["freerdp"]
+        return ["remmina", "freerdp"]
     return []
+
+
+def freerdp_packages() -> list[str]:
+    """Giữ tên cũ — trả về danh sách gói RDP đầy đủ."""
+    return rdp_client_packages()
 
 
 def install_command_argv() -> list[str] | None:
@@ -120,7 +132,7 @@ def install_command_argv() -> list[str] | None:
 def install_command_display() -> str:
     argv = install_command_argv()
     if not argv:
-        return "sudo apt install freerdp2-x11"
+        return "sudo apt install remmina remmina-plugin-rdp freerdp2-x11"
     return "sudo " + " ".join(argv)
 
 
@@ -130,7 +142,7 @@ def linux_install_hint() -> str:
 
 def run_install_freerdp(use_pkexec: bool = True) -> tuple[bool, str]:
     """
-    Cài xfreerdp qua trình quản lý gói hệ thống.
+    Cài Remmina + xfreerdp qua trình quản lý gói hệ thống.
     Trả về (thành_công, thông_báo).
     """
     if not _is_linux():
@@ -140,7 +152,7 @@ def run_install_freerdp(use_pkexec: bool = True) -> tuple[bool, str]:
     if not argv:
         return False, (
             "Không nhận diện được distro Linux (apt/dnf/pacman/zypper).\n"
-            "Cài thủ công: sudo apt install freerdp2-x11"
+            "Cài thủ công: sudo apt install remmina remmina-plugin-rdp"
         )
 
     if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -162,23 +174,37 @@ def run_install_freerdp(use_pkexec: bool = True) -> tuple[bool, str]:
             timeout=900,
         )
         if proc.returncode == 0:
-            return True, "Đã cài xfreerdp (FreeRDP) từ kho phần mềm hệ thống."
+            return True, "Đã cài Remmina (Remote Desktop) từ kho phần mềm hệ thống."
         detail = (proc.stderr or proc.stdout or "").strip()
         return False, detail or f"Cài đặt thất bại (mã {proc.returncode})."
     except subprocess.TimeoutExpired:
-        return False, "Hết thời gian chờ cài đặt xfreerdp."
+        return False, "Hết thời gian chờ cài đặt Remmina."
     except OSError as exc:
         return False, str(exc)
 
 
 def status_message(system_lookup) -> str:
-    path, lib = find_bundled_freerdp()
-    if path:
-        return f"Client RDP: xfreerdp đóng gói ({os.path.basename(path)})"
+    if _is_linux() and shutil.which("remmina"):
+        return "Client RDP: Remote Desktop (Remmina engine)"
+    if _is_linux() and shutil.which("flatpak"):
+        for flatpak_id in ("org.remmina.Remmina", "com.remmina.Remmina"):
+            try:
+                r = subprocess.run(
+                    ["flatpak", "info", flatpak_id],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if r.returncode == 0:
+                    return "Client RDP: Remote Desktop (Remmina Flatpak)"
+            except (OSError, subprocess.SubprocessError):
+                pass
     try:
         kind, ref = system_lookup()
         if ref:
             return f"Client RDP: {kind or ref}"
     except Exception:
         pass
-    return f"Chưa có xfreerdp — sẽ tự cài khi bạn dùng Remote hoặc chạy: {install_command_display()}"
+    path, _lib = find_bundled_freerdp()
+    if path:
+        return f"Client RDP: xfreerdp đóng gói ({os.path.basename(path)})"
+    return f"Chưa có client RDP — cài Remmina hoặc: {install_command_display()}"
